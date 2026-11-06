@@ -1,0 +1,9 @@
+{
+  "name": "sk-join-group",
+  "plugin": "SK Join Group",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "一次性：深空 API 售后群主动申请加群（reqToJoinGroup）",
+  "author": "dengyie"
+}

@@ -1,0 +1,20 @@
+# 运行时与凭据（绝不入库）
+.env
+token
+history.json
+result.json
+*.state
+.relogin_state
+.webui_token
+.onebot_token
+.qq_password
+qrcode.png
+
+# 备份/临时
+*.bak-*
+*.bak
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store

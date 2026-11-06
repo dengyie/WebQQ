@@ -1,0 +1,9 @@
+{
+  "name": "napcat-plugin-joiner",
+  "plugin": "QQ 群操作台",
+  "version": "1.4.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "常驻插件：在容器内提供 QQ 群搜索 / 加群 / 退群 / 群列表 的 HTTP 页面（口令鉴权）",
+  "author": "dengyie"
+}

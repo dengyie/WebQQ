@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>QQ 群操作台</title>
+<style>
+  :root {
+    --bg: #070a0f;
+    --card: rgba(255,255,255,.045);
+    --line: rgba(255,255,255,.09);
+    --text: #e8edf5;
+    --muted: #8b97a8;
+    --mint: #6ee7b7;
+    --sky: #7dd3fc;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+    background:
+      radial-gradient(900px 500px at 12% -8%, rgba(110,231,183,.14), transparent 60%),
+      radial-gradient(800px 480px at 88% -12%, rgba(125,211,252,.13), transparent 60%),
+      var(--bg);
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 40px 20px 72px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+  h1 { font-size: 21px; font-weight: 650; letter-spacing: .2px; margin: 0; }
+  h1 span { color: var(--mint); }
+  .sub { color: var(--muted); font-size: 13px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+    padding: 20px; margin-bottom: 16px; backdrop-filter: blur(14px);
+  }
+  .card h2 { font-size: 15px; margin: 0 0 14px; font-weight: 600; color: #cfd8e6; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  input[type=text], input[type=password], textarea {
+    flex: 1; min-width: 180px; padding: 11px 13px; border-radius: 12px;
+    border: 1px solid var(--line); background: rgba(0,0,0,.28); color: var(--text);
+    font: inherit; outline: none; transition: border-color .15s;
+  }
+  input:focus, textarea:focus { border-color: rgba(110,231,183,.55); }
+  textarea { width: 100%; min-height: 64px; resize: vertical; }
+  button {
+    padding: 11px 16px; border-radius: 12px; border: 1px solid rgba(110,231,183,.35);
+    background: linear-gradient(180deg, rgba(110,231,183,.22), rgba(110,231,183,.10));
+    color: #d7fff1; font: inherit; font-weight: 600; cursor: pointer; transition: filter .15s, transform .05s;
+  }
+  button:hover { filter: brightness(1.15); }
+  button:active { transform: translateY(1px); }
+  button.ghost { background: rgba(255,255,255,.05); border-color: var(--line); color: var(--text); font-weight: 500; }
+  button.danger { background: rgba(248,113,113,.14); border-color: rgba(248,113,113,.4); color: #ffd9d9; }
+  button:disabled { opacity: .5; cursor: default; }
+  .group-hit { margin-top: 14px; border: 1px solid var(--line); border-radius: 14px; padding: 14px; display: none; }
+  .group-hit.show { display: block; }
+  .gname { font-size: 17px; font-weight: 650; }
+  .gmeta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .gq { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.25); color: #ffe9b0; font-size: 13.5px; }
+  .gq.hide { display: none; }
+  .hint { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
+  .status { margin-top: 12px; font-size: 13.5px; min-height: 20px; }
+  .status.ok { color: var(--mint); } .status.err { color: var(--bad); } .status.info { color: var(--sky); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid rgba(255,255,255,.06); }
+  th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
+  td.num { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .hist { font-size: 13px; color: #b8c3d3; }
+  .hist div { padding: 7px 0; border-bottom: 1px dashed rgba(255,255,255,.06); }
+  .hist b { color: #dce6f4; font-weight: 600; }
+  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+  /* modal */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+  .overlay.show { display: flex; }
+  .modal { width: 100%; max-width: 460px; background: #0d131b; border: 1px solid rgba(255,255,255,.12); border-radius: 18px; padding: 22px; box-shadow: 0 24px 80px rgba(0,0,0,.5); }
+  .modal h3 { margin: 0 0 12px; font-size: 16px; }
+  .modal .lines { font-size: 13.5px; color: #b8c3d3; margin-bottom: 16px; }
+  .modal .lines div { padding: 3px 0; }
+  .modal .lines b { color: #fff; }
+  .modal .acts { display: flex; gap: 10px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>QQ 群操作台</h1>
+    <div class="sub">搜索 / 加群 / 退群 · 仅本人使用</div>
+  </header>
+
+  <section class="card">
+    <h2>申请加群</h2>
+    <div class="row">
+      <input id="gid" type="text" inputmode="numeric" placeholder="输入 QQ 群号" autocomplete="off">
+      <button id="btnSearch">搜索</button>
+    </div>
+    <div id="hit" class="group-hit">
+      <div class="gname" id="hitName">—</div>
+      <div class="gmeta" id="hitMeta">—</div>
+      <div class="gq hide" id="hitQ"></div>
+      <div class="row" style="margin-top:12px">
+        <button id="btnJoin">申请加群</button>
+      </div>
+    </div>
+    <div id="joinStatus" class="status"></div>
+    <div class="hint">先搜索确认群名与验证问题，再点「申请加群」二次确认后提交。需要答验证问题的群必须先填答案。</div>
+  </section>
+
+  <section class="card">
+    <h2>群内发消息（申请体验额度）</h2>
+    <div class="row">
+      <select id="sGroup"></select>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="sUid" type="text" inputmode="numeric" placeholder="用户 ID，例如 11" autocomplete="off">
+      <button id="btnSend">发送</button>
+    </div>
+    <textarea id="sCustom" placeholder="自定义文案（可留空，默认：用户 ID：{ID}，申请体验额度）" style="margin-top:10px;min-height:44px"></textarea>
+    <div class="hint" id="sPreview"></div>
+    <div id="sendStatus" class="status"></div>
+  </section>
+
+  <section class="card">
+    <h2>机器人所在群 <button id="btnRefreshGroups" class="ghost" style="float:right;padding:5px 12px;font-size:12.5px">刷新</button></h2>
+    <div id="groupsBox"><div class="empty">加载中…</div></div>
+  </section>
+
+  <section class="card">
+    <h2>最近操作</h2>
+    <div id="histBox" class="hist"><div class="empty">加载中…</div></div>
+  </section>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <h3 id="mTitle">确认操作</h3>
+    <div class="lines" id="mLines"></div>
+    <div class="row" id="mAnswerWrap" style="display:none;margin-bottom:16px">
+      <textarea id="mAnswer" placeholder="填写验证问题答案 / 入群口令"></textarea>
+    </div>
+    <div class="acts">
+      <button class="ghost" id="mCancel">取消</button>
+      <button id="mOk">确认</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const $ = (id) => document.getElementById(id);
+let current = null;
+let pending = null;
+let modalOpts = null;
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body ? 'POST' : 'GET',
+    // v1.3.0：口令已换成 HttpOnly cookie，浏览器里 token 为空就不再发空头；脚本/debug 仍可用 ?token=
+    headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Joiner-Token': token } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+    cache: 'no-store',
+  });
+  let data = {};
+  try { data = await r.json(); } catch {}
+  if (!r.ok || !data.ok) {
+    const err = new Error(data.error || ('HTTP ' + r.status));
+    err.payload = data;
+    throw err;
+  }
+  return data.data;
+}
+
+function setStatus(el, text, kind) { el.className = 'status' + (kind ? ' ' + kind : ''); el.textContent = text || ''; }
+
+function optionLabel(o) {
+  switch (o) {
+    case 0: return '可直接加入';
+    case 1: return '需管理员审核';
+    case 2: return '需管理员审核（含验证信息）';
+    case 3: return '禁止任何人加入';
+    case 4: return '需回答验证问题（管理员审核）';
+    case 5: return '需回答验证问题（自动通过）';
+    default: return '加群设置未知（' + o + '）';
+  }
+}
+
+async function search() {
+  const g = $('gid').value.trim();
+  if (!/^\d{5,15}$/.test(g)) { setStatus($('joinStatus'), '请输入正确的群号数字', 'err'); return; }
+  $('btnSearch').disabled = true;
+  setStatus($('joinStatus'), '搜索中…', 'info');
+  try {
+    const info = await api('api/search', { group: g });
+    current = info;
+    $('hit').classList.add('show');
+    $('hitName').textContent = info.groupName || ('群 ' + info.groupCode);
+    $('hitMeta').textContent = '群号 ' + info.groupCode + ' · ' + optionLabel(info.groupOption);
+    const q = $('hitQ');
+    if (info.question) { q.classList.remove('hide'); q.textContent = '验证问题：' + info.question; }
+    else { q.classList.add('hide'); q.textContent = ''; }
+    if (info.groupOption === 3) {
+      setStatus($('joinStatus'), '该群禁止任何人加入', 'err');
+      $('btnJoin').disabled = true;
+    } else {
+      setStatus($('joinStatus'), '已找到群，确认无误后点「申请加群」', 'ok');
+      $('btnJoin').disabled = false;
+    }
+  } catch (e) {
+    current = null; $('hit').classList.remove('show');
+    setStatus($('joinStatus'), '搜索失败：' + e.message, 'err');
+  } finally { $('btnSearch').disabled = false; }
+}
+
+function openModal({ title, lines, needAnswer, question, okText, okClass, onOk, statusEl }) {
+  $('mTitle').textContent = title;
+  $('mLines').innerHTML = lines.map(([k, v]) => `<div>${k}：<b>${escapeHtml(String(v))}</b></div>`).join('');
+  $('mAnswerWrap').style.display = needAnswer ? 'block' : 'none';
+  $('mAnswer').value = '';
+  if (needAnswer) $('mAnswer').placeholder = question ? ('答案 / 口令：' + question) : '答案 / 口令';
+  const ok = $('mOk');
+  ok.textContent = okText || '确认';
+  ok.className = okClass || '';
+  ok.disabled = false;
+  pending = onOk;
+  modalOpts = { statusEl };
+  $('overlay').classList.add('show');
+  setTimeout(() => (needAnswer ? $('mAnswer') : ok).focus(), 30);
+}
+
+function closeModal() { $('overlay').classList.remove('show'); pending = null; }
+
+$('mCancel').onclick = closeModal;
+$('overlay').onclick = (e) => { if (e.target === $('overlay')) closeModal(); };
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+$('mOk').onclick = async () => {
+  if (!pending) return;
+  const fn = pending;
+  $('mOk').disabled = true;
+  try { await fn($('mAnswer').value.trim()); closeModal(); }
+  catch (e) { setStatus((modalOpts && modalOpts.statusEl) || $('joinStatus'), e.message, 'err'); $('mOk').disabled = false; }
+};
+
+$('btnSearch').onclick = search;
+$('gid').addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
+
+$('btnJoin').onclick = () => {
+  if (!current) return;
+  const needAnswer = !!current.question; // 有验证问题或口令的群都展示答案框（4/5 必填，其它可选）
+  openModal({
+    title: '确认让机器人申请加群？',
+    lines: [
+      ['群名', current.groupName],
+      ['群号', current.groupCode],
+      ['设置', optionLabel(current.groupOption)],
+      ...(current.question ? [['验证问题', current.question]] : []),
+    ],
+    needAnswer,
+    question: current.question,
+    okText: '确认申请',
+    onOk: async (answer) => {
+      if ((current.groupOption === 4 || current.groupOption === 5) && !answer) throw new Error('该群必须回答验证问题，请填写答案');
+      setStatus($('joinStatus'), '提交中…', 'info');
+      const r = await api('api/join', { group: current.groupCode, answer });
+      const gname = r.groupInfo?.groupName || current.groupCode;
+      if (r.status === 'joined') {
+        setStatus($('joinStatus'), '机器人已在该群，无需重复申请：' + gname, 'ok');
+      } else if (r.status === 'pending') {
+        setStatus($('joinStatus'), (r.cached ? '申请仍在审核中（冷却期内未重复提交）：' : '申请已提交，等待管理员审核：') + gname + '，稍后自动刷新群列表', 'info');
+      } else {
+        setStatus($('joinStatus'), '加群申请已提交：' + gname + '（' + optionLabel(r.groupInfo?.groupOption ?? current.groupOption) + '）', 'ok');
+      }
+      preferGroup = current.groupCode;
+      scheduleGroupPoll();
+      loadHistory();
+    },
+  });
+};
+
+let preferGroup = '';
+let pollTimer = 0;
+
+function scheduleGroupPoll() {
+  clearTimeout(pollTimer);
+  let n = 0;
+  const tick = () => {
+    n++;
+    loadGroups();
+    if (n >= 3) return;
+    pollTimer = setTimeout(tick, n === 1 ? 8000 : 20000);
+  };
+  tick();
+}
+
+async function loadGroups() {
+  const box = $('groupsBox');
+  box.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const list = await api('api/groups');
+    if (!list.length) { box.innerHTML = '<div class="empty">机器人当前不在任何群</div>'; return; }
+    const rows = list
+      .sort((a, b) => (a.group_name || '').localeCompare(b.group_name || '', 'zh'))
+      .map((g) => `<tr>
+        <td class="num">${escapeHtml(g.group_id)}</td>
+        <td>${escapeHtml(g.group_name || '—')}</td>
+        <td class="num">${Number.isFinite(g.member_count) ? g.member_count : '—'}</td>
+        <td style="text-align:right"><button class="danger" data-leave="${escapeHtml(g.group_id)}" data-name="${escapeHtml(g.group_name || '')}" style="padding:5px 12px;font-size:12.5px">退出</button></td>
+      </tr>`).join('');
+    box.innerHTML = `<table><thead><tr><th>群号</th><th>群名</th><th>人数</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    fillGroupSelect(list);
+    box.querySelectorAll('button[data-leave]').forEach((b) => {
+      b.onclick = () => {
+        const gid = b.dataset.leave, name = b.dataset.name;
+        openModal({
+          title: '确认让机器人退出该群？',
+          lines: [['群名', name || '—'], ['群号', gid]],
+          okText: '确认退出',
+          okClass: 'danger',
+          onOk: async () => {
+            setStatus($('joinStatus'), '退出中…', 'info');
+            await api('api/leave', { group: gid });
+            setStatus($('joinStatus'), '已退出：' + (name || gid), 'ok');
+            loadGroups(); loadHistory();
+          },
+        });
+      };
+    });
+  } catch (e) { box.innerHTML = '<div class="empty">加载失败：' + escapeHtml(e.message) + '</div>'; }
+}
+
+async function loadHistory() {
+  const box = $('histBox');
+  try {
+    const list = await api('api/history');
+    if (!list.length) { box.innerHTML = '<div class="empty">暂无记录</div>'; return; }
+    const label = { search: '搜索', join: '加群', leave: '退群' };
+    box.innerHTML = list.slice().reverse().map((h) =>
+      `<div>${escapeHtml(h.ts.replace('T', ' ').slice(0, 19))} · <b>${label[h.action] || h.action}</b> · ${escapeHtml(h.groupName || h.group)}${h.groupName ? '（' + escapeHtml(h.group) + '）' : ''}</div>`
+    ).join('');
+  } catch (e) { box.innerHTML = '<div class="empty">加载失败：' + escapeHtml(e.message) + '</div>'; }
+}
+
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+function fillGroupSelect(list) {
+  const sel = $('sGroup');
+  const cur = sel.value;
+  sel.innerHTML = list.map((g) => '<option value="' + escapeHtml(g.group_id) + '">' + escapeHtml(g.group_name || g.group_id) + '（' + escapeHtml(g.group_id) + '）</option>').join('');
+  const want = cur || preferGroup;
+  if (want && list.some((g) => g.group_id === want)) sel.value = want;
+}
+
+function sendText() {
+  const uid = $('sUid').value.trim();
+  const cust = $('sCustom').value.trim();
+  if (cust) return cust;
+  return uid ? ('用户 ID：' + uid + '，申请体验额度') : '';
+}
+
+function updPreview() {
+  const t = sendText();
+  $('sPreview').textContent = t ? ('将发送：' + t) : '将发送：待填用户 ID';
+}
+
+$('sUid').addEventListener('input', updPreview);
+$('sCustom').addEventListener('input', updPreview);
+
+$('btnSend').onclick = () => {
+  const sel = $('sGroup');
+  const gid = sel.value;
+  if (!gid) { setStatus($('sendStatus'), '请先选择群（列表为空说明机器人不在任何群）', 'err'); return; }
+  const uid = $('sUid').value.trim();
+  if (!uid) { setStatus($('sendStatus'), '请填写用户 ID', 'err'); return; }
+  const name = (sel.selectedOptions[0] && sel.selectedOptions[0].textContent || '').replace(/（.*$/, '');
+  const text = sendText();
+  openModal({
+    title: '确认在群里发送这条消息？',
+    lines: [['群名', name || gid], ['群号', gid], ['消息', text]],
+    okText: '确认发送',
+    statusEl: $('sendStatus'),
+    onOk: async () => {
+      setStatus($('sendStatus'), '发送中…', 'info');
+      await api('api/send', { group: gid, userId: uid, text: $('sCustom').value.trim() || undefined });
+      setStatus($('sendStatus'), '已发送到：' + (name || gid), 'ok');
+      loadHistory();
+    },
+  });
+};
+
+$('btnRefreshGroups').onclick = loadGroups;
+loadGroups();
+loadHistory();
+</script>
+</body>
+</html>
