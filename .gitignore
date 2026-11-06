@@ -6,9 +6,16 @@ result.json
 *.state
 .relogin_state
 .webui_token
+.webui_cred
 .onebot_token
 .qq_password
 qrcode.png
+
+# NapCat 容器运行时数据（登录态、配置、缓存、日志，可能含 OneBot/QQ 凭据）
+napcat/config/
+napcat/qq/
+napcat/cache/
+napcat/logs/
 
 # 备份/临时
 *.bak-*

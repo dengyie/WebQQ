@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import pathlib
+import tempfile
 import time
 import urllib.request
 
@@ -23,9 +24,31 @@ BASE = os.environ.get("QQ_WEBUI_BASE", "http://127.0.0.1:6099").rstrip("/")
 TOKEN_FILE = pathlib.Path(os.environ.get("QQ_WEBUI_TOKEN_FILE", "/opt/qq-bot/.webui_token"))
 PASS_FILE = pathlib.Path(os.environ.get("QQ_PASSWORD_FILE", "/opt/qq-bot/.qq_password"))
 STATE_FILE = pathlib.Path(os.environ.get("QQ_RELOGIN_STATE", "/opt/qq-bot/.relogin_state"))
-CRED_FILE = pathlib.Path(os.environ.get("QQ_WEBUI_CRED_FILE", "/tmp/qq-webui-cred"))
+# 凭据缓存不能放 /tmp：同一台机器上任何用户都能预创建/替换，等于把 WebUI 凭据
+# 交给本地竞争方。固定放在运维目录（0600），与 state/密码文件同源。
+CRED_FILE = pathlib.Path(os.environ.get("QQ_WEBUI_CRED_FILE", "/opt/qq-bot/.webui_cred"))
 MIN_INTERVAL = int(os.environ.get("QQ_RELOGIN_MIN_INTERVAL", 30 * 60))  # 两次尝试最小间隔
 MAX_TRIES = int(os.environ.get("QQ_RELOGIN_MAX_TRIES", 3))              # 一轮掉线最多尝试次数
+
+
+def atomic_write(path, text):
+    """同目录临时文件 + fsync + rename：崩溃时不会留下半截状态/凭据。"""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def call(path, data, cred=""):
@@ -42,27 +65,39 @@ def call(path, data, cred=""):
 
 
 def credential(force=False):
-    if not force and CRED_FILE.exists():
-        cached = CRED_FILE.read_text().strip()
+    if not force:
+        try:
+            cached = CRED_FILE.read_text().strip()
+        except Exception:
+            cached = ""
         if cached:
             return cached
     digest = hashlib.sha256((TOKEN_FILE.read_text().strip() + ".napcat").encode()).hexdigest()
     cred = call("/api/auth/login", {"hash": digest, "totpCode": ""})["data"]["Credential"]
-    CRED_FILE.write_text(cred)
-    CRED_FILE.chmod(0o600)
+    try:
+        atomic_write(CRED_FILE, cred)
+    except Exception:
+        pass  # 缓存写不进去也不能影响本次调用
     return cred
 
 
 def load_state():
+    """状态缺失 = 全新；损坏 = fail-safe 标记，交由 tick 停止自动重登。"""
     try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
+        raw = STATE_FILE.read_text()
+    except FileNotFoundError:
         return {}
+    except Exception:
+        return {"corrupt": True}
+    try:
+        st = json.loads(raw)
+    except Exception:
+        return {"corrupt": True}
+    return st if isinstance(st, dict) else {"corrupt": True}
 
 
 def save_state(st):
-    STATE_FILE.write_text(json.dumps(st))
-    STATE_FILE.chmod(0o600)
+    atomic_write(STATE_FILE, json.dumps(st))
 
 
 def status():
@@ -74,7 +109,10 @@ def status():
 
 def attempt(st, now):
     """发起一次账密登录，返回 (结果, 详情)，同时把计数写回 st。"""
-    uin, pwd = PASS_FILE.read_text().strip().split(":", 1)
+    try:
+        uin, pwd = PASS_FILE.read_text().strip().split(":", 1)
+    except Exception as exc:  # 密码文件缺失/格式错:不算一次尝试,也不碰登录接口
+        return "error", exc
     md5 = hashlib.md5(pwd.encode()).hexdigest()
     st["tries"] = st.get("tries", 0) + 1
     st["last"] = now
@@ -96,7 +134,7 @@ def attempt(st, now):
 
 
 def tick():
-    """看一次登录态；需要时尝试一次重登。返回状态字符串，供看门狗/命令行判断。"""
+    """看一次登录态;需要时尝试一次重登。返回状态字符串,供看门狗/命令行判断。"""
     st = load_state()
     now = int(time.time())
     data = status()
@@ -107,6 +145,8 @@ def tick():
             return "recovered"
         return "online"
 
+    if st.get("corrupt"):
+        return "corrupt"  # 状态文件损坏:不盲目重登,等人工处理
     if st.get("tries", 0) >= MAX_TRIES:
         return "capped"
     if now - st.get("last", 0) < MIN_INTERVAL:
@@ -127,6 +167,7 @@ MESSAGES = {
     "success": "账密重登已受理，等待内核上线",
     "captcha": "触发滑块验证，需人工",
     "newdevice": "触发新设备验证，需人工",
+    "corrupt": "状态文件损坏，已停止自动重登（等人工检查）",
 }
 
 
@@ -138,6 +179,9 @@ def main():
         print(f"离线，冷却中（上次尝试 {now - st.get('last', 0)}s 前，"
               f"第 {st.get('tries', 0)}/{MAX_TRIES} 次）")
         return 0
+    if result == "corrupt":
+        print("状态文件损坏，已停止自动重登，请人工检查 " + str(STATE_FILE))
+        return 2
     if result.startswith("error:"):
         print(f"第 {st.get('tries', 0)} 次账密重登请求失败：{result[6:]}")
         return 1

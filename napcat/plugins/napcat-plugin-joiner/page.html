@@ -333,9 +333,9 @@ async function loadHistory() {
   try {
     const list = await api('api/history');
     if (!list.length) { box.innerHTML = '<div class="empty">暂无记录</div>'; return; }
-    const label = { search: '搜索', join: '加群', leave: '退群' };
+    const label = { search: '搜索', join: '加群', leave: '退群', send: '发消息' };
     box.innerHTML = list.slice().reverse().map((h) =>
-      `<div>${escapeHtml(h.ts.replace('T', ' ').slice(0, 19))} · <b>${label[h.action] || h.action}</b> · ${escapeHtml(h.groupName || h.group)}${h.groupName ? '（' + escapeHtml(h.group) + '）' : ''}</div>`
+      `<div>${escapeHtml(String(h.ts || '').replace('T', ' ').slice(0, 19))} · <b>${label[h.action] || escapeHtml(h.action)}</b> · ${escapeHtml(h.groupName || h.group)}${h.groupName ? '（' + escapeHtml(h.group) + '）' : ''}</div>`
     ).join('');
   } catch (e) { box.innerHTML = '<div class="empty">加载失败：' + escapeHtml(e.message) + '</div>'; }
 }

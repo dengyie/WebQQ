@@ -1,6 +1,8 @@
 services:
   napcat:
-    image: mlikiowa/napcat-docker:latest
+    # 固定已验证的版本：`:latest` 会在某次 `docker compose pull` 时悄悄升级内核，
+    # 插件依赖的 GroupApi/MsgApi 行为可能随之变化。升级前先看 digest 再改这里。
+    image: mlikiowa/napcat-docker:v4.18.41
     container_name: qq-napcat
     restart: unless-stopped
     environment:
@@ -10,11 +12,22 @@ services:
       WEBUI_PREFIX: ""
       ACCOUNT: "${QQ_ACCOUNT:?set QQ_ACCOUNT in .env}"
       TZ: Asia/Shanghai
+      # 插件读取的运行时配置：不在这里透传，宿主机 .env 里写了也不会生效。
+      JOINER_ALLOW_HOSTS: "${JOINER_ALLOW_HOSTS:-}"
+      JOINER_TRUSTED_PROXIES: "${JOINER_TRUSTED_PROXIES:-127.0.0.1,::1}"
+      JOINER_KERNEL_QUEUE_MAX: "${JOINER_KERNEL_QUEUE_MAX:-8}"
+      JOINER_KERNEL_WAIT_MS: "${JOINER_KERNEL_WAIT_MS:-10000}"
+      JOINER_KERNEL_TIMEOUT_MS: "${JOINER_KERNEL_TIMEOUT_MS:-0}"
+      JOINER_KERNEL_MAX: "${JOINER_KERNEL_MAX:-2}"
+      JOINER_KERNEL_ZOMBIE_MS: "${JOINER_KERNEL_ZOMBIE_MS:-0}"
+      JOINER_AUTH_FAIL_WINDOW_MS: "${JOINER_AUTH_FAIL_WINDOW_MS:-600000}"
+    # 只发布到本机回环。要经内网/mesh 访问，用 compose.mesh.yml 追加绑定，
+    # 不要在这里再写一条 ${MESH_IP:-127.0.0.1}:6099:6099 —— MESH_IP 留空时
+    # 两条都会绑 127.0.0.1:6099，Docker 直接报 port already allocated。
     ports:
       - "127.0.0.1:6099:6099"
-      - "${MESH_IP:-127.0.0.1}:6099:6099"
       - "127.0.0.1:3000:3000"
-      - "${MESH_IP:-127.0.0.1}:19001:19001"
+      - "127.0.0.1:19001:19001"
     volumes:
       - ./napcat/config:/app/napcat/config
       - ./napcat/qq:/app/.config/QQ

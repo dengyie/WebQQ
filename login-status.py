@@ -1,38 +1,16 @@
 #!/usr/bin/env python3
-"""打印 NapCat 登录阶段；若最近一次流程是被风控拒绝则输出 risk-control。"""
-import hashlib, json, pathlib, subprocess, urllib.request
+"""打印 NapCat 登录阶段；若最近一次流程是被风控拒绝则输出 risk-control。
 
-BASE = "http://127.0.0.1:6099"
-TOKEN = pathlib.Path("/opt/qq-bot/.webui_token").read_text().strip()
-CRED = pathlib.Path("/tmp/qq-webui-cred")
+凭据获取/状态检查直接复用 relogin.py，避免两处各写一份 /tmp 缓存与鉴权逻辑
+（旧版本在这里硬编码 /tmp/qq-webui-cred，与 relogin 的缓存互不相认）。
+"""
+import pathlib
+import subprocess
+import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-def call(path, data, cred=""):
-    headers = {"Content-Type": "application/json"}
-    if cred:
-        headers["Authorization"] = "Bearer " + cred
-    req = urllib.request.Request(BASE + path, data=json.dumps(data).encode(), method="POST", headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        return json.loads(resp.read().decode())
-
-
-def credential(force=False):
-    if not force and CRED.exists():
-        cached = CRED.read_text().strip()
-        if cached:
-            return cached
-    digest = hashlib.sha256((TOKEN + ".napcat").encode()).hexdigest()
-    cred = call("/api/auth/login", {"hash": digest, "totpCode": ""})["data"]["Credential"]
-    CRED.write_text(cred)
-    CRED.chmod(0o600)
-    return cred
-
-
-def status():
-    try:
-        return call("/api/QQLogin/CheckLoginStatus", {}, credential())["data"]
-    except Exception:
-        return call("/api/QQLogin/CheckLoginStatus", {}, credential(force=True))["data"]
+from relogin import status  # noqa: E402
 
 
 def last_flow_event():

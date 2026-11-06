@@ -21,16 +21,21 @@ const buckets = { search: [], join: [], leave: [], send: [] };
 function now() { return new Date().toISOString(); }
 function isDigits(s) { return /^\d{5,15}$/.test(String(s || "").trim()); }
 
-function withTimeout(promise, ms, label) {
-  let timer = null;
-  const timeout = new Promise((_, rej) => {
-    timer = setTimeout(() => rej(new Error(label + " 超时(" + ms + "ms)")), ms);
-    if (typeof timer.unref === "function") timer.unref();
-  });
-  // 旧实现：promise 先完成时定时器不 clear，每次内核调用残留一个 15~20s 的 handle
-  return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
-    if (timer) { clearTimeout(timer); timer = null; }
-  });
+// —— 环境变量解析 ——
+// 裸 Number() + Math.max(x, NaN) 会返回 NaN，而 NaN 参与比较恒为 false：
+// 鉴权窗口「永不过期」、队列上限「无界」、setTimeout(NaN) 变成 0ms 立即 503。
+// 写错一个环境变量不该静默关掉安全阀，所以统一校验，启动时告警并回退默认值。
+const ENV_WARNINGS = new Set();
+function envInt(name, def, min) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === "") return def;
+  const s = String(raw).trim();
+  const n = /^\d+(?:\.\d+)?$/.test(s) ? Number(s) : NaN;
+  if (!Number.isFinite(n) || n < min) {
+    ENV_WARNINGS.add(`${name}=${JSON.stringify(raw)} 非法（需要 ≥${min} 的数字），已回退默认值 ${def}`);
+    return def;
+  }
+  return n;
 }
 
 function rcOf(res) {
@@ -41,7 +46,7 @@ function rcOf(res) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-const JOIN_COOLDOWN_MS = 600e3; // 10 分钟：pending(result=1) 内不重复提交
+const JOIN_COOLDOWN_MS = 600e3; // 10 分钟：result=0/1（已提交/待审核）内不重复提交
 const lastJoin = new Map();
 
 // —— 口令换 cookie（v1.3.0）——
@@ -52,15 +57,43 @@ const lastJoin = new Map();
 const COOKIE_NAME = "joiner_token";
 const COOKIE_MAX_AGE = 30 * 24 * 3600;
 const AUTH_FAIL_LIMIT = 20;
-const AUTH_FAIL_WINDOW_MS = 600e3;
+const AUTH_FAIL_WINDOW_MS = envInt("JOINER_AUTH_FAIL_WINDOW_MS", 600e3, 1000);
 const authFails = new Map(); // ip -> { n, at }
+let authPruneAt = 0;
 
+// 只有受信反代（Cloudflare tunnel / 本机）才允许用转发头改写来源 IP。
+// 否则 mesh 内任何一台机器都能伪造 cf-connecting-ip，把别人的 IP 锁掉。
+// 生产用 JOINER_TRUSTED_PROXIES=<mesh 地址>；默认只信任 loopback。
+const TRUSTED_PROXIES = new Set(
+  (process.env.JOINER_TRUSTED_PROXIES || "127.0.0.1,::1")
+    .split(",").map((x) => x.trim()).filter(Boolean),
+);
+function isTrustedPeer(addr) {
+  const a = String(addr || "").replace(/^::ffff:/, "");
+  return !!a && TRUSTED_PROXIES.has(a);
+}
 function clientIp(req) {
-  const cf = req.headers["cf-connecting-ip"];
-  if (cf) return String(cf).trim();
-  const xf = req.headers["x-forwarded-for"];
-  if (xf) return String(xf).split(",")[0].trim();
-  return req.socket?.remoteAddress || "unknown";
+  const peer = req.socket?.remoteAddress || "";
+  if (isTrustedPeer(peer)) {
+    const cf = req.headers["cf-connecting-ip"];
+    if (cf) return String(cf).trim();
+    const xf = req.headers["x-forwarded-for"];
+    if (xf) return String(xf).split(",")[0].trim();
+  }
+  return peer || "unknown";
+}
+
+// 路由统计的键必须有限：未鉴权请求也会写 STATS.routes/latency，
+// 旧实现直接拿 pathname 当键，随机路径能把内存撑爆（容器与 NapCat 共享 1200m）。
+const ROUTE_KEYS = new Set([
+  "/api/search", "/api/join", "/api/leave", "/api/send",
+  "/api/groups", "/api/history", "/api/stats",
+]);
+function routeKeyOf(p) {
+  if (ROUTE_KEYS.has(p)) return p;
+  if (p.startsWith("/api/")) return "/api/other";
+  if (p === "/" || p.endsWith(".html")) return "/";
+  return "other";
 }
 
 function cookieGet(header, name) {
@@ -74,14 +107,22 @@ function cookieGet(header, name) {
   return "";
 }
 
-function authBlocked(ip, t) {
+function authBlocked(ip, t = Date.now()) {
   const r = authFails.get(ip);
   if (!r) return false;
+  // 旧实现漏传 t：NaN 比较恒为 false，窗口形同虚设，锁定 10 分钟后仍不解封
   if (t - r.at > AUTH_FAIL_WINDOW_MS) { authFails.delete(ip); return false; }
   return r.n >= AUTH_FAIL_LIMIT;
 }
 
+function pruneAuthFails(t) {
+  if (t - authPruneAt < 60e3) return;
+  authPruneAt = t;
+  for (const [k, v] of authFails) if (t - v.at > AUTH_FAIL_WINDOW_MS) authFails.delete(k);
+}
+
 function noteAuthFail(ip, t) {
+  pruneAuthFails(t);
   const r = authFails.get(ip);
   if (!r || t - r.at > AUTH_FAIL_WINDOW_MS) authFails.set(ip, { n: 1, at: t });
   else { r.n += 1; r.at = t; }
@@ -97,7 +138,9 @@ function noteAuthFail(ip, t) {
 const HISTORY_KEEP = 200;
 let SRV = null;
 let STOP_WATCHES = [];
-const STATS = { startedAt: Date.now(), requests: 0, routes: {}, kernel: {}, groupsHit: 0, groupsMiss: 0, errors: 0, authFailures: 0, joinDedup: 0 };
+let LOGGER = null;
+let cancelKernelWaiters = null;
+const STATS = { startedAt: Date.now(), requests: 0, routes: {}, kernel: {}, kernelTimeouts: 0, kernelZombies: 0, groupsHit: 0, groupsMiss: 0, errors: 0, authFailures: 0, joinDedup: 0, historyWriteFailures: 0 };
 const eventLoopHist = monitorEventLoopDelay({ resolution: 20 });
 let histSince = 0; // 本实例直方图的起点（reset 时刻），用于 /api/stats 说明统计窗口
 let PLUGIN_DIR = "";
@@ -105,6 +148,7 @@ let hbuf = null;      // null = 尚未从磁盘载入
 let hTimer = null;
 let hDirty = false;
 let hWriting = null;  // 在途异步写：保证写盘顺序，cleanup 前要等它落地
+let hFailLoggedAt = 0;
 
 function historyFile() { return path.join(PLUGIN_DIR, "history.json"); }
 
@@ -119,19 +163,28 @@ function hload() {
   return hbuf;
 }
 
+function noteHistoryWriteFailure(e) {
+  STATS.historyWriteFailures++;
+  const t = Date.now();
+  if (t - hFailLoggedAt < 60e3) return;
+  hFailLoggedAt = t;
+  try { LOGGER?.logError?.("joiner: history write failed", e); } catch {}
+}
+
 function hflush(sync) {
-  hTimer = null;
+  // 同步 flush（cleanup）时也不能留下已排定的合并定时器：它会在实例卸载后再写一次盘。
+  if (hTimer) { clearTimeout(hTimer); hTimer = null; }
   if (!hDirty || !hbuf) return;
   hDirty = false;
   const text = hbuf.map((x) => JSON.stringify(x)).join("\n") + (hbuf.length ? "\n" : "");
   if (sync) {
-    try { fs.writeFileSync(historyFile(), text, { mode: 0o600 }); } catch {}
+    try { fs.writeFileSync(historyFile(), text, { mode: 0o600 }); } catch (e) { noteHistoryWriteFailure(e); }
     return;
   }
   // 串行化：并发/乱序的 writeFile 会让旧快照覆盖新快照（丢最后几条审计记录）
   hWriting = (hWriting || Promise.resolve())
     .then(() => fs.promises.writeFile(historyFile(), text, { mode: 0o600 }))
-    .catch(() => {});
+    .catch((e) => noteHistoryWriteFailure(e));
 }
 
 function recordHistory(action, group, groupName, result, extra) {
@@ -155,6 +208,7 @@ function recordHistory(action, group, groupName, result, extra) {
 export async function plugin_init(ctx) {
   const pluginPath = ctx.pluginPath || process.cwd();
   PLUGIN_DIR = pluginPath;
+  LOGGER = ctx.logger || null;
 
   // 口令文件：不存在则生成（0600）；读取按 mtime 缓存，替换文件即热轮换
   const tokenFile = path.join(pluginPath, "token");
@@ -175,7 +229,13 @@ export async function plugin_init(ctx) {
     try { pageHtmlText = fs.readFileSync(pageHtml, "utf8"); } catch { pageHtmlText = ""; }
   }
   function loadToken() {
-    try { tokenValue = String(fs.readFileSync(tokenFile, "utf8")).trim(); } catch { tokenValue = ""; }
+    // 读到空/失败时保留上一次有效口令：轮换文件（truncate 后写入）的瞬间或误删文件
+    // 不能把内存口令击穿成 ""，否则所有请求立刻 401，还会白耗鉴权失败次数。
+    // 吊销口令的方式是写入新值，而不是删文件。
+    try {
+      const s = String(fs.readFileSync(tokenFile, "utf8")).trim();
+      if (s) tokenValue = s;
+    } catch {}
   }
   loadPage();
   loadToken();
@@ -183,9 +243,16 @@ export async function plugin_init(ctx) {
   // 统计口径 = 当前实例：热重载后 requests/kernel/uptime 一起归零。
   // （限流 buckets 与鉴权失败表故意不重置——重载不该成为绕过限流或解锁 IP 的手段。）
   Object.assign(STATS, {
-    startedAt: Date.now(), requests: 0, routes: {}, kernel: {},
-    groupsHit: 0, groupsMiss: 0, errors: 0, authFailures: 0, joinDedup: 0,
+    startedAt: Date.now(), requests: 0, routes: {}, kernel: {}, kernelTimeouts: 0, kernelZombies: 0,
+    groupsHit: 0, groupsMiss: 0, errors: 0, authFailures: 0, joinDedup: 0, historyWriteFailures: 0,
   });
+  hFailLoggedAt = 0;
+  // 历史缓冲也是「本实例」的状态：不清的话，上一实例遗留的未落盘记录
+  // 会被带进新实例，且 hload() 可能返回旧快照。
+  if (hTimer) { clearTimeout(hTimer); hTimer = null; }
+  hbuf = null;
+  hDirty = false;
+  for (const m of ENV_WARNINGS) ctx.logger.logError("joiner: " + m);
 
   // 事件循环延迟直方图：不开 enable 的话读出来是空值（NaN→null），指标等于没有。
   // reset()：插件热重载后清掉上一实例的样本——否则 /api/stats 的 max 会一直带着上次的尖峰，
@@ -219,17 +286,22 @@ export async function plugin_init(ctx) {
     return crypto.timingSafeEqual(a, b);
   }
   // 三个来源按优先级：?token=（首次进入）→ X-Joiner-Token（脚本）→ cookie（浏览器后续请求）
+  // 注意：高优先级来源错了不能短路低优先级——旧书签里的旧 query token 不该压过有效 cookie。
   function authOf(req, url) {
     const q = url.searchParams.get("token") || "";
-    if (q) return { ok: tokenEqual(q), source: "query" };
     const h = req.headers["x-joiner-token"] || "";
-    if (h) return { ok: tokenEqual(h), source: "header" };
     const c = cookieGet(req.headers.cookie, COOKIE_NAME);
-    if (c) return { ok: tokenEqual(c), source: "cookie" };
-    return { ok: false, source: "none" };
+    if (q && tokenEqual(q)) return { ok: true, source: "query", badQuery: false };
+    if (h && tokenEqual(h)) return { ok: true, source: "header", badQuery: !!q };
+    if (c && tokenEqual(c)) return { ok: true, source: "cookie", badQuery: !!q };
+    return { ok: false, source: q ? "query" : (h ? "header" : (c ? "cookie" : "none")), badQuery: !!q };
   }
   function cookieAttrs(req) {
-    const proto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+    // x-forwarded-proto 只在受信反代后面才可信：否则直连的客户端可以自报 https，
+    // 拿到一个 Secure cookie（随后在 http 上不再发送，只坑自己，但没有理由接受这种输入）。
+    const proto = isTrustedPeer(req.socket?.remoteAddress)
+      ? String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim()
+      : "";
     const secure = proto === "https" || !!req.socket?.encrypted;
     return "HttpOnly; Path=/joiner; SameSite=Lax; Max-Age=" + COOKIE_MAX_AGE + (secure ? "; Secure" : "");
   }
@@ -278,13 +350,23 @@ export async function plugin_init(ctx) {
     return +sorted[i].toFixed(2);
   }
 
-  const KERNEL_MAX = 2;
-  const KERNEL_QUEUE_MAX = Math.max(1, Number(process.env.JOINER_KERNEL_QUEUE_MAX || 8));
-  const KERNEL_WAIT_MS = Math.max(50, Number(process.env.JOINER_KERNEL_WAIT_MS || 10000));
+  const KERNEL_MAX = envInt("JOINER_KERNEL_MAX", 2, 1);
+  const KERNEL_QUEUE_MAX = envInt("JOINER_KERNEL_QUEUE_MAX", 8, 1);
+  const KERNEL_WAIT_MS = envInt("JOINER_KERNEL_WAIT_MS", 10000, 50);
+  const KERNEL_TIMEOUT_OVERRIDE = envInt("JOINER_KERNEL_TIMEOUT_MS", 0, 0);
+  // 僵尸槽位的硬上限：内核调用既不 resolve 也不 reject 时（NTEvent 挂死），
+  // 「槽位只在底层 settle 后释放」会让 2 个槽位被永久占死、插件内核 API 一直 503。
+  // 超时后再等这么久仍不 settle，就判定为僵尸、强制回收并计数告警（自愈）。
+  // 0 = 按单次超时的 5 倍，且不少于 60s。
+  const KERNEL_ZOMBIE_MS = envInt("JOINER_KERNEL_ZOMBIE_MS", 0, 0);
+  const kernelTimeoutMs = (def) => KERNEL_TIMEOUT_OVERRIDE || def;
+  const kernelZombieMs = (timeoutMs) => KERNEL_ZOMBIE_MS || Math.max(60000, timeoutMs * 5);
   let kernelActive = 0;
+  let closing = false;
   let kernelQueueRejected = 0; // 队列满直接拒
   let kernelQueueTimeout = 0;  // 排队等到超时
-  const kernelWaiters = []; // { grant, timer, cancelled }
+  const kernelWaiters = []; // { grant, reject, timer, cancelled }
+  const kernelZombies = new Set(); // { timer, release }：已超时但仍未 settle 的调用
 
   function kernelBusy(msg, extra) {
     const e = new Error(msg);
@@ -309,6 +391,7 @@ export async function plugin_init(ctx) {
   }
 
   async function kernelAcquire() {
+    if (closing) throw kernelBusy("插件正在卸载，请稍后重试", { closing: true });
     if (kernelActive < KERNEL_MAX) { kernelActive++; return; }
     if (kernelWaiters.length >= KERNEL_QUEUE_MAX) {
       kernelQueueRejected++;
@@ -319,6 +402,7 @@ export async function plugin_init(ctx) {
         cancelled: false,
         timer: null,
         grant: () => resolve(),
+        reject,
       };
       w.timer = setTimeout(() => {
         if (w.cancelled) return;
@@ -333,11 +417,69 @@ export async function plugin_init(ctx) {
     });
   }
 
-  async function kernelCall(label, fn) {
+  // cleanup 时把还在排队的请求全部拒掉：旧实现只关 server，队列里的 join/leave/send
+  // 仍可能在插件卸载后拿到槽位并执行，向已经关闭的响应写数据。
+  cancelKernelWaiters = () => {
+    closing = true;
+    for (const w of kernelWaiters.splice(0)) {
+      if (w.cancelled) continue;
+      w.cancelled = true;
+      if (w.timer) { clearTimeout(w.timer); w.timer = null; }
+      try { w.reject(kernelBusy("插件正在卸载，请稍后重试", { closing: true })); } catch {}
+    }
+    for (const z of kernelZombies) { clearTimeout(z.timer); z.timer = null; }
+    kernelZombies.clear();
+  };
+
+  async function kernelCall(label, fn, timeoutMs, timeoutLabel) {
     await kernelAcquire(); // 超时/队列满都在这里抛 503，未拿到槽位就不会进 try
+    // 槽位可能在排队期间被 cleanup 取消；拿到后要再确认一次，避免卸载后启动新调用。
+    if (closing) { kernelHandoff(); throw kernelBusy("插件正在卸载，请稍后重试", { closing: true }); }
     STATS.kernel[label] = (STATS.kernel[label] || 0) + 1;
-    try { return await fn(); }
-    finally { kernelHandoff(); }
+    let timer = null;
+    let zombie = null; // 超时之后才存在的僵尸回收器
+    // 槽位释放必须幂等：正常 settle 与僵尸回收都会走到这里，只能执行一次。
+    let released = false;
+    const release = () => { if (released) return; released = true; kernelHandoff(); };
+    const disarmZombie = () => {
+      if (!zombie) return;
+      clearTimeout(zombie.timer);
+      kernelZombies.delete(zombie);
+      zombie = null;
+    };
+    const work = Promise.resolve().then(fn); // 底层内核 promise（不是超时包装）
+    // 关键不变量：槽位只在底层 settle 后释放。超时只让 HTTP 先回 503，
+    // 不能把仍在跑的内核调用当成已结束——否则「最多 2 个并发」失效。
+    work.then(() => { disarmZombie(); release(); }, () => { disarmZombie(); release(); });
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        STATS.kernelTimeouts++;
+        // 但「永远不 settle」的调用（NTEvent 挂死）会永久占死槽位，实测 2 个之后
+        // 插件所有内核 API 一直 503 到手动重载。所以再等一个硬上限，到期判定为僵尸、
+        // 强制回收并计数——最坏情况是有界（约 1~2 分钟）的降级，而不是永久不可用。
+        const ms = kernelZombieMs(timeoutMs);
+        zombie = {
+          timer: setTimeout(() => {
+            kernelZombies.delete(zombie);
+            zombie = null;
+            STATS.kernelZombies++;
+            try {
+              LOGGER?.logError?.(`joiner: 内核调用 ${label} 超时后又 ${ms}ms 未返回，判定为僵尸并回收槽位`);
+            } catch {}
+            release();
+          }, ms),
+        };
+        if (typeof zombie.timer.unref === "function") zombie.timer.unref();
+        kernelZombies.add(zombie);
+        reject(kernelBusy((timeoutLabel || label) + " 超时(" + timeoutMs + "ms)，请稍后重试", { kernelTimeout: true }));
+      }, timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+    });
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      if (timer) { clearTimeout(timer); timer = null; }
+    }
   }
 
   async function doSearch(keyword) {
@@ -345,9 +487,9 @@ export async function plugin_init(ctx) {
     if (!groupApi || typeof groupApi.searchGroup !== "function") throw new Error("GroupApi.searchGroup unavailable");
     let searched;
     try {
-      searched = await kernelCall("searchGroup", () => withTimeout(Promise.resolve(groupApi.searchGroup(String(keyword).trim())), 15000, "searchGroup"));
+      searched = await kernelCall("searchGroup", () => groupApi.searchGroup(String(keyword).trim()), kernelTimeoutMs(15000), "searchGroup");
     } catch (e) {
-      // 配置/能力问题要原样上抛（500），容量问题要保留 503，只有内核超时才翻成友好文案
+      // 配置/能力问题要原样上抛（500），容量/超时要保留 503，其余内核错误翻成友好文案
       if (e?.busy || /unavailable/i.test(String(e?.message || ""))) throw e;
       throw new Error("群号不存在或搜索超时，请稍后重试");
     }
@@ -374,14 +516,14 @@ export async function plugin_init(ctx) {
   function groupsFresh() { return !!groupsCache.data && Date.now() - groupsCache.at < GROUPS_TTL_MS; }
   function invalidateGroups() { groupsGen++; groupsCache = { at: 0, data: null }; }
 
-  async function doListGroups(force) {
-    if (!force && groupsFresh()) return groupsCache.data;
+  async function doListGroups() {
+    if (groupsFresh()) return groupsCache.data;
     if (groupsInflight) return groupsInflight;
     groupsInflight = (async () => {
       const gen = groupsGen;
       const groupApi = ctx.core?.apis?.GroupApi;
       if (!groupApi || typeof groupApi.getGroups !== "function") throw new Error("GroupApi.getGroups unavailable");
-      const raw = await kernelCall("getGroups", () => withTimeout(Promise.resolve(groupApi.getGroups(false)), 15000, "getGroups"));
+      const raw = await kernelCall("getGroups", () => groupApi.getGroups(false), kernelTimeoutMs(15000), "getGroups");
       const src = [raw?.groupList, raw?.groups, raw?.result?.groupList, Array.isArray(raw) ? raw : null].find(Array.isArray) || [];
       const data = src.map((g) => ({
         group_id: String(g.groupCode ?? g.groupId ?? g.group_id ?? ""),
@@ -420,10 +562,21 @@ export async function plugin_init(ctx) {
       return { status: "joined", code: 0, message: "机器人已在该群", groupInfo: null, nativeResult: null, arity: 0 };
     }
 
-    // 冷却去重：最近一次 result=1（待审核）且未过 10 分钟 → 直接回 pending，不重复发申请
+    // 冷却去重：最近一次 result=0/1（已提交/待审核）且未过 10 分钟 → 直接回原状态，不重复发申请
     const prev = lastJoin.get(String(group));
-    if (prev && Date.now() - prev.ts < JOIN_COOLDOWN_MS && prev.code === 1) {
-      return { status: "pending", code: 1, message: "申请已提交，等待管理员审核（冷却期内不重复提交）", groupInfo: prev.groupInfo || null, nativeResult: null, cached: true, cooldownMs: JOIN_COOLDOWN_MS - (Date.now() - prev.ts) };
+    if (prev && Date.now() - prev.ts < JOIN_COOLDOWN_MS && (prev.code === 0 || prev.code === 1)) {
+      const status = prev.status || (prev.code === 1 ? "pending" : "submitted");
+      return {
+        status,
+        code: prev.code,
+        message: prev.code === 1
+          ? "申请已提交，等待管理员审核（冷却期内不重复提交）"
+          : "加群申请已提交（冷却期内不重复提交）",
+        groupInfo: prev.groupInfo || null,
+        nativeResult: null,
+        cached: true,
+        cooldownMs: JOIN_COOLDOWN_MS - (Date.now() - prev.ts),
+      };
     }
 
     const info = await doSearch(group);
@@ -450,11 +603,11 @@ export async function plugin_init(ctx) {
 
     const arity = gs.reqToJoinGroup.length ?? -1;
     const result = await kernelCall("reqToJoinGroup", () => (arity >= 2
-      ? withTimeout(Promise.resolve(gs.reqToJoinGroup(String(group), req)), 20000, "reqToJoinGroup")
-      : withTimeout(Promise.resolve(gs.reqToJoinGroup(req)), 20000, "reqToJoinGroup")));
+      ? gs.reqToJoinGroup(String(group), req)
+      : gs.reqToJoinGroup(req)), kernelTimeoutMs(20000), "reqToJoinGroup");
 
     const rc = rcOf(result);
-    lastJoin.set(String(group), { ts: Date.now(), code: rc, groupInfo: info });
+    lastJoin.set(String(group), { ts: Date.now(), code: rc, status: rc === 1 ? "pending" : (rc === 0 ? "submitted" : "failed"), groupInfo: info });
     for (const [k, v] of lastJoin) if (Date.now() - v.ts > JOIN_COOLDOWN_MS) lastJoin.delete(k);
 
     if (Number.isNaN(rc)) throw new Error("加群返回无法识别，请稍后重试");
@@ -468,6 +621,7 @@ export async function plugin_init(ctx) {
     }
 
     recordHistory("join", String(group), info.groupName, { result: rc, errMsg: "" }, { groupOption: info.groupOption });
+    invalidateGroups(); // rc=0 视为加群成功：群列表的旧快照不再可信
     return { status: "submitted", code: 0, message: "加群申请已提交（部分群需管理员审核后入群）", groupInfo: info, nativeResult: result, arity };
   }
 
@@ -479,11 +633,12 @@ export async function plugin_init(ctx) {
     if (dryRun) return { dryRun: true, wouldLeave: String(group) };
     let result;
     if (typeof gs.quitGroup === "function") {
-      result = await kernelCall("quitGroup", () => withTimeout(Promise.resolve(gs.quitGroup(String(group))), 20000, "quitGroup"));
+      result = await kernelCall("quitGroup", () => gs.quitGroup(String(group)), kernelTimeoutMs(20000), "quitGroup");
     } else {
       const groupApi = ctx.core?.apis?.GroupApi;
       if (!groupApi || typeof groupApi.quitGroup !== "function") throw new Error("quitGroup unavailable");
-      result = await kernelCall("quitGroup", () => groupApi.quitGroup(String(group)));
+      // 兜底分支同样要超时：旧实现漏了 withTimeout，内核不 settle 会永久占槽
+      result = await kernelCall("quitGroup", () => groupApi.quitGroup(String(group)), kernelTimeoutMs(20000), "quitGroup");
     }
     const lr = rcOf(result);
     if (lr !== 0) {
@@ -491,6 +646,7 @@ export async function plugin_init(ctx) {
       recordHistory("leave", String(group), "", { result: Number.isNaN(lr) ? "unknown" : lr, errMsg: msg }, { ok: false });
       throw new Error("退群失败：" + (Number.isNaN(lr) ? "未知返回" : "result=" + lr) + (msg ? " " + msg : ""));
     }
+    lastJoin.delete(String(group)); // 退群后允许重新申请，不被上次的加群冷却挡住
     recordHistory("leave", String(group), "", { result: 0, errMsg: "" }, { ok: true });
     invalidateGroups();
     return { status: "left", code: 0, message: "已退出该群", nativeResult: result };
@@ -509,10 +665,24 @@ export async function plugin_init(ctx) {
     if (!rate("send")) { const e = new Error("发送请求过于频繁（20 次/小时），请稍后再试"); e.statusCode = 429; throw e; }
     const peer = { chatType: 2, guildId: "", peerUid: String(g.group_id) };
     const elements = [{ elementType: 1, elementId: "", textElement: { content: text, atType: 0, atUid: "", atTinyId: "", atNtUid: "" } }];
-    const r = await kernelCall("sendMsg", () => withTimeout(Promise.resolve(msgApi.sendMsg(peer, elements)), 20000, "sendMsg"));
+    const r = await kernelCall("sendMsg", () => msgApi.sendMsg(peer, elements), kernelTimeoutMs(20000), "sendMsg");
     if (!r) throw new Error("发送消息失败（内核无返回）");
-    recordHistory("send", String(g.group_id), g.group_name, String(r.msgId || ""), { userId });
-    return { group: String(g.group_id), groupName: g.group_name, text, msgId: String(r.msgId || "") };
+    const src = r?.data && typeof r.data === "object" ? r.data : r;
+    const rc = rcOf(r);
+    const msgId = String(src?.msgId ?? src?.message_id ?? src?.messageId ?? r?.msgId ?? r?.message_id ?? "").trim();
+    if (Number.isFinite(rc) && rc !== 0) {
+      const err = new Error("发送消息失败：result=" + rc + (r?.errMsg ? " " + r.errMsg : ""));
+      err.statusCode = 502;
+      throw err;
+    }
+    // 内核可能只返回 {}（请求被受理但没有回执）。这时不能报成功——消息可能没发出去。
+    if (!msgId) {
+      const err = new Error("发送消息结果无法确认（内核未返回 msgId）");
+      err.statusCode = 502;
+      throw err;
+    }
+    recordHistory("send", String(g.group_id), g.group_name, msgId, { userId });
+    return { group: String(g.group_id), groupName: g.group_name, text, msgId };
   }
 
   const BASE_HEADERS = {
@@ -524,6 +694,8 @@ export async function plugin_init(ctx) {
   };
 
   function send(res, code, obj) {
+    if (res.headersSent || res.writableEnded) return; // 已写过就不要再写（双写会抛 ERR_HTTP_HEADERS_SENT）
+    if (code >= 400) STATS.errors++; // 错误响应统一计数：401/429/5xx 都算，不只是未捕获异常
     const body = JSON.stringify(obj);
     res.writeHead(code, {
       "Content-Type": "application/json; charset=utf-8",
@@ -560,7 +732,13 @@ export async function plugin_init(ctx) {
         try {
           const text = Buffer.concat(chunks).toString("utf8");
           resolve(text ? JSON.parse(text) : {});
-        } catch { reject(new Error("invalid json")); }
+        } catch {
+          // 客户端 payload 格式错误是 4xx，不是服务端 500（否则监控会把客户端
+          // 错误算成故障，排障时会往内核/磁盘方向查错）。
+          const e = new Error("invalid json");
+          e.statusCode = 400;
+          reject(e);
+        }
       });
       req.on("error", fail);
     });
@@ -572,7 +750,7 @@ export async function plugin_init(ctx) {
     if (!p.startsWith("/")) p = "/" + p;
 
     STATS.requests++;
-    const routeKey = p.startsWith("/api/") ? p : (p === "/" || p.endsWith(".html") ? "/" : "other");
+    const routeKey = routeKeyOf(p);
     STATS.routes[routeKey] = (STATS.routes[routeKey] || 0) + 1;
     const t0 = process.hrtime.bigint();
     res.once("finish", () => {
@@ -585,21 +763,12 @@ export async function plugin_init(ctx) {
 
     try {
       const ip = clientIp(req);
-      if (authBlocked(ip)) {
+      if (authBlocked(ip, Date.now())) {
         send(res, 429, { ok: false, error: "too many auth failures, retry later" });
         return;
       }
       const auth = authOf(req, url);
       if (!auth.ok) {
-        // 页面请求带过期口令（旧书签）但 cookie 仍有效：清掉地址栏里的旧 token，别让人卡在 401
-        if ((p === "/" || p.endsWith(".html")) && auth.source === "query") {
-          const c = cookieGet(req.headers.cookie, COOKIE_NAME);
-          if (c && tokenEqual(c)) {
-            res.writeHead(302, { "Location": p === "/" ? "/joiner/" : p.replace(/^\//, "/joiner/"), ...BASE_HEADERS });
-            res.end();
-            return;
-          }
-        }
         STATS.authFailures++;
         noteAuthFail(ip, Date.now());
         send(res, 401, { ok: false, error: "unauthorized" });
@@ -608,6 +777,14 @@ export async function plugin_init(ctx) {
       authFails.delete(ip); // 成功即销账，避免偶发输错累积成封禁
       if (req.method === "POST" && auth.source === "cookie" && !originAllowed(req)) {
         send(res, 403, { ok: false, error: "bad origin" });
+        return;
+      }
+
+      // 旧书签里的 query token 过期，但 cookie 仍有效：302 到干净地址，别让人卡在 401。
+      // 只在「最终靠 cookie 通过」时跳转；header 脚本场景继续直接回页面。
+      if ((p === "/" || p.endsWith(".html")) && auth.source === "cookie" && auth.badQuery) {
+        res.writeHead(302, { "Location": p === "/" ? "/joiner/" : p.replace(/^\//, "/joiner/"), ...BASE_HEADERS });
+        res.end();
         return;
       }
 
@@ -643,14 +820,18 @@ export async function plugin_init(ctx) {
           requests: STATS.requests,
           routes: STATS.routes,
           kernel: STATS.kernel,
+          kernelTimeouts: STATS.kernelTimeouts,
+          kernelZombies: STATS.kernelZombies,
           cache: { groupsHit: STATS.groupsHit, groupsMiss: STATS.groupsMiss },
           errors: STATS.errors,
           authFailures: STATS.authFailures,
           joinDedup: STATS.joinDedup,
+          historyWriteFailures: STATS.historyWriteFailures,
           authBlockedIps: authFails.size,
+          rate: Object.fromEntries(Object.keys(RATES).map((k) => [k, buckets[k].length])),
           eventLoopDelayMs: { mean: ms(el.mean), p50: ms(el.percentile(50)), p99: ms(el.percentile(99)), max: ms(el.max) },
           eventLoopWindowMs: histSince ? Date.now() - histSince : null,
-          kernelQueue: { waiting: kernelWaiters.length, rejected: kernelQueueRejected, timeout: kernelQueueTimeout },
+          kernelQueue: { active: kernelActive, waiting: kernelWaiters.length, rejected: kernelQueueRejected, timeout: kernelQueueTimeout, zombies: kernelZombies.size },
           latencyMs: Object.fromEntries(Object.entries(latency).map(([k, v]) => {
             const sorted = [...v.samples].sort((a, b) => a - b);
             return [k, { n: v.n, p50: pct(sorted, 0.5), p99: pct(sorted, 0.99), max: pct(sorted, 1) }];
@@ -662,10 +843,11 @@ export async function plugin_init(ctx) {
       }
 
       if (p === "/api/groups" && req.method === "GET") {
-        // 命中缓存时不再计一次 search 配额（页面轮询否则会白吃 120/h 的限制）
+        // 命中缓存时不再计一次 search 配额（页面轮询否则会白吃 120/h 的限制）。
+        // 已有在途 getGroups 时也不计：10 个并发应共享同一次内核调用、只吃 1 个配额。
         const fresh = groupsFresh();
         if (fresh) STATS.groupsHit++; else STATS.groupsMiss++;
-        if (!fresh && !rate("search")) { send(res, 429, { ok: false, error: "rate limited" }); return; }
+        if (!fresh && !groupsInflight && !rate("search")) { send(res, 429, { ok: false, error: "rate limited" }); return; }
         try {
           send(res, 200, { ok: true, data: await doListGroups() });
         } catch (e) {
@@ -744,14 +926,19 @@ export async function plugin_init(ctx) {
 
       send(res, 404, { ok: false, error: "not found" });
     } catch (e) {
-      STATS.errors++;
+      // 错误计数在 send() 里统一做（code>=400）；这里只兜未预期的抛错。
       send(res, e?.statusCode || 500, { ok: false, error: String(e?.message || e) });
     }
   });
 
   // 慢连接/慢头请求的兜底（默认 requestTimeout 300s，配合隧道容易长期占 socket）
   server.headersTimeout = 10000;
-  server.requestTimeout = 20000;
+  // 单请求最坏预算：/api/join 会串行打 3 次内核（getGroups → search → reqToJoinGroup），
+  // 每次都可能先排队（KERNEL_WAIT_MS）再超时。requestTimeout 小于这个上界时，
+  // 内核一慢服务端就先掐连接，客户端拿不到干净的 503，/api/stats 也少一条样本。
+  const KERNEL_CALLS_PER_REQUEST = 3;
+  const KERNEL_CALL_MAX_MS = Math.max(KERNEL_TIMEOUT_OVERRIDE, 20000);
+  server.requestTimeout = Math.max(20000, KERNEL_CALLS_PER_REQUEST * (KERNEL_WAIT_MS + KERNEL_CALL_MAX_MS) + 5000);
   server.keepAliveTimeout = 5000;
 
   SRV = server;
@@ -775,6 +962,10 @@ export async function plugin_init(ctx) {
 }
 
 export async function plugin_cleanup() {
+  // 先拒绝仍在排队的 join/leave/send：否则 server.close() 后它们还能拿到槽位，
+  // 在已卸载的实例上继续打内核、向已关闭的响应写数据。
+  try { cancelKernelWaiters?.(); } catch {}
+  cancelKernelWaiters = null;
   // 合并落盘的兜底：先等在途异步写落地，再同步写最终快照，避免旧快照覆盖新快照
   try { await hWriting; } catch {}
   try { hflush(true); } catch {}

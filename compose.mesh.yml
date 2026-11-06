@@ -1,0 +1,11 @@
+# 可选覆盖：把 WebUI(6099) 与插件(19001)额外发布到 mesh/内网网卡。
+#
+#   docker compose -f compose.yml -f compose.mesh.yml up -d
+#
+# 必须先在 .env 里把 MESH_IP 填成本机 mesh 地址；留空或填 127.0.0.1 会与
+# compose.yml 里的回环绑定冲突（port already allocated）。
+services:
+  napcat:
+    ports:
+      - "${MESH_IP:?set MESH_IP to this host's mesh address}:6099:6099"
+      - "${MESH_IP:?set MESH_IP to this host's mesh address}:19001:19001"

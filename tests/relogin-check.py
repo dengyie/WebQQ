@@ -147,7 +147,19 @@ reset()
 state["mode"] = "rejected"
 check("命令行退出码 1", relogin.main() == 1, "rejected")
 
-# 10. WebUI 不可达：抛错而不是瞎登录（看门狗负责吞掉并等下一轮）
+# 10. 状态文件损坏：fail-safe，绝不发起登录（等人工），命令行退 2
+reset()
+(tmp / "state").write_text("{corrupt-json!!!")
+r = relogin.tick()
+check("状态损坏即停", r == "corrupt" and state["pw_calls"] == 0, r)
+check("状态损坏退出码 2", relogin.main() == 2, "corrupt")
+(tmp / "state").write_text("{}")
+relogin.save_state({"tries": 0})
+leftovers = [p.name for p in tmp.iterdir() if p.name.startswith(".state.")]
+check("原子写不留临时文件", not leftovers, leftovers)
+check("状态文件 0600", (tmp / "state").stat().st_mode & 0o777 == 0o600)
+
+# 11. WebUI 不可达：抛错而不是瞎登录（看门狗负责吞掉并等下一轮）
 server.shutdown()
 try:
     relogin.tick()

@@ -9,6 +9,10 @@ import path from "node:path";
 const PDIR = process.env.JOINER_DIR || "/tmp/joiner-mock/plugin";
 const B = "http://127.0.0.1:19001";
 
+// 鉴权锁定窗口压到 2.5s，才能在测试里验证「过期自动解锁」；
+// 生产默认 10 分钟（index.mjs 的 AUTH_FAIL_WINDOW_MS）。
+process.env.JOINER_AUTH_FAIL_WINDOW_MS = "2500";
+
 // ---------- 预置：250 条历史，用于验证「载入时只保留最近 200」 ----------
 {
   const lines = [];
@@ -26,6 +30,7 @@ const state = {
   join: { result: 0, errMsg: "" },
   leave: { result: 0, errMsg: "success" },
   sent: [],
+  sendResult: null,
 };
 
 const GroupApi = {
@@ -52,6 +57,7 @@ const MsgApi = {
   async sendMsg(peer, elements) {
     calls.sendMsg++;
     state.sent.push({ peer, elements });
+    if (state.sendResult !== null) return state.sendResult;
     return { msgId: "mock-msg-" + calls.sendMsg };
   },
 };
@@ -115,7 +121,7 @@ function rqRaw(p, body, tok = token) {
   });
 }
 
-test("napcat-plugin-joiner v1.6.0", async (t) => {
+test("napcat-plugin-joiner v1.6.3", async (t) => {
   const { plugin_init, plugin_cleanup } = await import(path.join(PDIR, "index.mjs"));
   await plugin_init(ctx);
   token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
@@ -165,6 +171,10 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     assert.equal(stale.headers.get("location"), "/joiner/");
     assert.equal(stale.headers.get("set-cookie"), null, "回落时不应重设 cookie");
 
+    // 高优先级来源错了不能短路低优先级：旧 query token + 有效 header/cookie 的 API 仍应通过
+    assert.equal((await rq("/api/groups?token=" + "0".repeat(48))).status, 200, "stale query + 有效 header 应通过");
+    assert.equal((await rq("/api/groups?token=" + "0".repeat(48), { tok: "", cookie: ck })).status, 200, "stale query + 有效 cookie 应通过");
+
     // 走 https 时 Cookie 必须带 Secure
     const sec = (await fetch(B + "/?token=" + token, { redirect: "manual", headers: { "x-forwarded-proto": "https" } })).headers.get("set-cookie");
     assert.match(sec, /Secure/);
@@ -200,6 +210,11 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     const stats = (await rq("/api/stats")).json.data;
     assert.ok(stats.authFailures >= 20, "失败次数应被统计，实际 " + stats.authFailures);
     assert.ok(stats.authBlockedIps >= 1);
+
+    // 锁定必须能过期：否则 10 分钟窗口形同虚设，只能重启容器
+    await sleep(2700);
+    const unblocked = await fetch(B + "/api/groups", { headers: { "X-Joiner-Token": token, "cf-connecting-ip": IP } });
+    assert.equal(unblocked.status, 200, "窗口过期后应自动解锁");
   });
 
   await t.test("口令热轮换：替换 token 文件后旧口令失效（watch 失效 + 内存缓存）", async () => {
@@ -214,6 +229,21 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     fs.writeFileSync(tf, oldTok, { mode: 0o600 });
     await sleep(1300);
     assert.equal((await rq("/api/groups")).status, 200, "换回后旧口令恢复");
+  });
+
+  await t.test("token 文件被清空/读失败的瞬间，内存口令不能被击穿（否则全员 401 + 白耗鉴权失败计数）", async () => {
+    const tf = path.join(PDIR, "token");
+    const real = token;
+    fs.writeFileSync(tf, "", { mode: 0o600 }); // truncate 替换的瞬间形态
+    await sleep(1300);
+    assert.equal((await rq("/api/groups", { tok: real })).status, 200, "文件为空时旧口令应继续有效");
+    assert.equal((await rq("/api/groups", { tok: "", cookie: "joiner_token=" + real })).status, 200, "cookie 也应继续有效");
+    fs.unlinkSync(tf); // 文件被删也一样
+    await sleep(1300);
+    assert.equal((await rq("/api/groups", { tok: real })).status, 200, "文件被删时旧口令应继续有效");
+    fs.writeFileSync(tf, real, { mode: 0o600 });
+    await sleep(1300);
+    assert.equal((await rq("/api/groups")).status, 200, "恢复后一切照常");
   });
 
   await t.test("CSRF：同源 Origin（非白名单 Host）也必须放行", async () => {
@@ -305,16 +335,25 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     }
   });
 
-  await t.test("TTL 4s 后重新打内核，且并发只打一次", async () => {
+  await t.test("TTL 4s 后重新打内核，且并发只打一次，rate bucket 增 1", async () => {
     await sleep(4200);
     calls.getGroups = 0;
+    const statsBefore = (await rq("/api/stats")).json.data;
+    const rateBefore = statsBefore.rate;
     assert.equal((await rq("/api/groups")).status, 200);
     assert.equal(calls.getGroups, 1, "过期后应重新拉取");
+    const statsAfter0 = (await rq("/api/stats")).json.data;
+    const rateAfter0 = statsAfter0.rate;
+    assert.equal(rateAfter0.search - rateBefore.search, 1, "expire 后首个请求应吃 1 个 search 配额");
+
     await sleep(4200);
     calls.getGroups = 0;
     const rs = await Promise.all(Array.from({ length: 10 }, () => rq("/api/groups")));
     rs.forEach((r) => assert.equal(r.status, 200));
     assert.equal(calls.getGroups, 1, "并发 10 个应共享同一次内核调用");
+    const statsAfter1 = (await rq("/api/stats")).json.data;
+    const rateAfter1 = statsAfter1.rate;
+    assert.equal(rateAfter1.search - rateAfter0.search, 1, "10 个并发只吃 1 个 search 配额，实际 diff=" + (rateAfter1.search - rateAfter0.search));
   });
 
   await t.test("页面内存缓存且能热更新（watch 失效）", async () => {
@@ -332,7 +371,7 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     assert.equal(c.bytes, a.bytes);
   });
 
-  await t.test("readBody：超 8KB 回 413（不打断连接），非法 JSON 回 500", async () => {
+  await t.test("readBody：超 8KB 回 413（不打断连接），非法 JSON 回 400（客户端错误不是 500）", async () => {
     const big = await rq("/api/search", { method: "POST", rawBody: JSON.stringify({ group: "1".repeat(70 * 1024) }) });
     assert.equal(big.status, 413, "超大 body 应回 413");
     assert.match(big.json.error, /body too large/);
@@ -341,7 +380,7 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     const justOver = await rq("/api/search", { method: "POST", rawBody: JSON.stringify({ group: "1".repeat(9 * 1024) }) });
     assert.equal(justOver.status, 413, "刚超 8KB 也应拒绝");
     const bad = await rq("/api/search", { method: "POST", rawBody: "{not json" });
-    assert.equal(bad.status, 500);
+    assert.equal(bad.status, 400, "非法 JSON 是客户端错误，应回 400 而不是 500");
     assert.match(bad.json.error, /invalid json/);
     const fine = await rq("/api/search", { method: "POST", body: { group: "10000001" } });
     assert.equal(fine.status, 200, "正常大小的 body 不受影响");
@@ -379,6 +418,25 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     assert.equal(r.status, 200);
     assert.equal(r.json.data.status, "submitted");
     assert.equal(calls.reqToJoinGroup, 1);
+  });
+
+  await t.test("加群：result=0 也进入冷却，退群后解除", async () => {
+    state.join = { result: 0, errMsg: "" };
+    state.search.info = { groupCode: "232323", groupName: "冷却群", groupOption: 2, groupQuestion: "" };
+    const a = await rq("/api/join", { method: "POST", body: { group: "232323" } });
+    assert.equal(a.status, 200);
+    assert.equal(a.json.data.status, "submitted");
+    const before = calls.reqToJoinGroup;
+    const b = await rq("/api/join", { method: "POST", body: { group: "232323" } });
+    assert.equal(b.json.data.cached, true, "result=0 冷却期内应命中缓存");
+    assert.equal(b.json.data.status, "submitted");
+    assert.equal(calls.reqToJoinGroup, before, "冷却期内不应再发申请");
+
+    const lv = await rq("/api/leave", { method: "POST", body: { group: "232323" } });
+    assert.equal(lv.status, 200);
+    const c = await rq("/api/join", { method: "POST", body: { group: "232323" } });
+    assert.equal(c.json.data.cached, undefined, "退群后应解除冷却");
+    assert.equal(calls.reqToJoinGroup, before + 1, "退群后应允许重新申请");
   });
 
   await t.test("加群：result=1 → pending，且 10 分钟冷却内不重复提交", async () => {
@@ -479,6 +537,18 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     assert.equal(elements[0].textElement.content, "用户 ID：11，申请体验额度");
     assert.equal(elements[0].textElement.atType, 0);
 
+    // 内核返回 {}（受理但无回执）/ 非 0 result 都不能报成功
+    state.sendResult = {};
+    const noId = await rq("/api/send", { method: "POST", body: { group: "111111", userId: "11" } });
+    assert.equal(noId.status, 502);
+    assert.match(noId.json.error, /无法确认/);
+
+    state.sendResult = { result: 5, errMsg: "boom" };
+    const rcBad = await rq("/api/send", { method: "POST", body: { group: "111111", userId: "11" } });
+    assert.equal(rcBad.status, 502);
+    assert.match(rcBad.json.error, /result=5/);
+    state.sendResult = null;
+
     const long = await rq("/api/send", { method: "POST", body: { group: "111111", userId: "11", text: "x".repeat(501) } });
     assert.equal(long.status, 400);
   });
@@ -524,6 +594,9 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     assert.ok(d.cache.groupsHit > 0, "应有缓存命中记录");
     assert.equal(typeof d.authFailures, "number", "应暴露鉴权失败计数");
     assert.equal(typeof d.joinDedup, "number", "应暴露加群去重计数");
+    assert.ok(d.errors > 0, "错误响应（≥400）应被统一计数，实际 " + d.errors);
+    assert.equal(typeof d.kernelZombies, "number", "应暴露僵尸槽位回收计数");
+    assert.equal(typeof d.kernelQueue.zombies, "number", "应暴露当前僵尸数");
   });
 
   await t.test("路由级延迟：/api/search 变慢体现在 p99，不再只看得到全局均值", async () => {
@@ -559,7 +632,47 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     assert.equal(mode, "600");
   });
 
-  await t.test("withTimeout 不留残余定时器（否则进程活满 15~20s）", async () => {
+  await t.test("路由键基数：任意路径不爆炸 /api/stats 的 routes/latency 键（含 /joiner 反代前缀）", async () => {
+    for (let i = 0; i < 100; i++) {
+      const r = await rq("/api/nope-unknown-" + i);
+      assert.ok([401, 404, 400].includes(r.status));
+    }
+    // 线上真实形态：cloudflared 不改路径，容器里看到的是 /joiner/api/xxx；
+    // 前缀只剥一层，剩下的必须仍汇总进 /api/other，不能退化成 "other"。
+    for (let i = 0; i < 60; i++) {
+      const r = await rq("/joiner/api/nope-ingress-" + i);
+      assert.ok([401, 404, 400].includes(r.status));
+    }
+    const d = (await rq("/api/stats")).json.data;
+    const known = ["/", "/api/search", "/api/join", "/api/leave", "/api/send", "/api/groups", "/api/history", "/api/stats", "/api/other"];
+    const unknownCount = Object.keys(d.routes).filter((k) => !known.includes(k)).length;
+    assert.equal(unknownCount, 0, "routes 出现未知键：" + Object.keys(d.routes).join(","));
+    assert.ok((d.routes["/api/other"] || 0) >= 160, "未匹配的 /api/* 应汇总进 /api/other，实际 " + d.routes["/api/other"]);
+    const lkeys = Object.keys(d.latencyMs);
+    assert.ok(lkeys.every((k) => known.includes(k)), "latency 出现未知键：" + lkeys.join(","));
+  });
+
+  await t.test("历史写盘失败要计数并限频日志，且不丢在途记录", async () => {
+    const orig = fs.promises.writeFile;
+    const before = (await rq("/api/stats")).json.data.historyWriteFailures;
+    fs.promises.writeFile = async () => { throw new Error("mock disk full"); };
+    try {
+      await rq("/api/search", { method: "POST", body: { group: "10000001" } });
+      await sleep(1200); // 等 800ms 合并 flush 触发一次失败的异步写
+    } finally {
+      fs.promises.writeFile = orig;
+    }
+    const after = (await rq("/api/stats")).json.data;
+    assert.ok(after.historyWriteFailures > before, "写盘失败应被计数：" + before + " -> " + after.historyWriteFailures);
+    // 恢复后：清脏标记仍在，下一次动作应能重新落盘（记录不丢）
+    await rq("/api/search", { method: "POST", body: { group: "10000001" } });
+    await sleep(1200);
+    const disk = fs.readFileSync(path.join(PDIR, "history.json"), "utf8").split("\n").filter(Boolean);
+    const last = JSON.parse(disk.at(-1));
+    assert.equal(last.action, "search", "恢复后新历史应正常落盘");
+  });
+
+  await t.test("内核调用正常/超时路径都不留残余定时器（否则进程活满 15~20s）", async () => {
     await rq("/api/search", { method: "POST", body: { group: "10000001" } });
     await sleep(1200); // 让 history 合并定时器先落地
     const res = process.getActiveResourcesInfo();
@@ -609,5 +722,109 @@ test("napcat-plugin-joiner v1.6.0", async (t) => {
     assert.ok(err, "端口被占时 plugin_init 应拒绝");
     assert.match(String(err.code || err.message), /EADDRINUSE/);
     await plugin_cleanup(); // 清掉 failed init 注册的 watch
+  });
+
+  await t.test("quitGroup 兜底分支受超时保护：超时回 503，槽位随底层 settle 释放", async () => {
+    process.env.JOINER_KERNEL_TIMEOUT_MS = "300";
+    const slowGroupApi = {
+      ...GroupApi,
+      async quitGroup() { await new Promise((r) => setTimeout(r, 1200)); return { result: 0, errMsg: "success" }; },
+    };
+    const ctx2 = {
+      pluginPath: PDIR,
+      logger: ctx.logger,
+      // getGroupService 返回空对象 → doLeave 走 GroupApi.quitGroup 兜底分支（旧实现漏了超时）
+      core: { apis: { GroupApi: slowGroupApi, MsgApi }, context: { session: { getGroupService: () => ({}) } } },
+    };
+    await plugin_init(ctx2);
+    token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
+
+    const r = await rqRaw("/api/leave", { group: "11111111" });
+    assert.equal(r.status, 503, "兜底分支超时必须回 503");
+    assert.match(r.json.error, /超时/);
+    const mid = (await rq("/api/stats")).json.data;
+    assert.ok(mid.kernelTimeouts >= 1, "超时应被统计");
+    assert.equal(mid.kernelQueue.active, 1, "超时后底层仍在跑，槽位不能提前释放");
+
+    await sleep(1300); // 底层 1200ms 后 settle
+    const after = (await rq("/api/stats")).json.data;
+    assert.equal(after.kernelQueue.active, 0, "底层 settle 后槽位应释放");
+
+    await plugin_cleanup();
+    delete process.env.JOINER_KERNEL_TIMEOUT_MS;
+  });
+
+  await t.test("非法 JOINER_* 环境变量回退默认值（NaN 不能静默关掉闸门/队列）", async () => {
+    // 旧实现 Math.max(2, Number("abc")) === NaN：active < NaN 恒 false → 谁都不进闸门；
+    // waiters >= NaN 恒 false → 队列无界；setTimeout(NaN) → 立即 503。
+    process.env.JOINER_KERNEL_MAX = "abc";
+    process.env.JOINER_KERNEL_QUEUE_MAX = "abc";
+    process.env.JOINER_KERNEL_WAIT_MS = "bogus";
+    await plugin_init(ctx);
+    token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
+
+    state.searchDelay = 400;
+    state.searchConcurrent = 0;
+    state.maxSearchConcurrent = 0;
+    const rs = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+      rqRaw("/api/search", { group: "1000000" + i })));
+    state.searchDelay = 0;
+
+    assert.deepEqual(rs.map((r) => r.status), Array(8).fill(200),
+      "非法配置应回退默认（2 并发 + 8 队列），8 个请求都该成功，实际：" + rs.map((r) => r.status).join(","));
+    assert.ok(state.maxSearchConcurrent <= 2,
+      "并发上限应回退到默认 2，实际峰值 " + state.maxSearchConcurrent);
+
+    await plugin_cleanup();
+    delete process.env.JOINER_KERNEL_MAX;
+    delete process.env.JOINER_KERNEL_QUEUE_MAX;
+    delete process.env.JOINER_KERNEL_WAIT_MS;
+  });
+
+  await t.test("内核永不 settle：硬上限后强制回收僵尸槽位，插件自愈不再永久 503", async () => {
+    // 复现线上风险：searchGroup 既不 resolve 也不 reject。旧实现里两个槽位被永久占死，
+    // 插件所有内核 API 一直 503 直到手动重载；现在超过 ZOMBIE_MS 应自动回收。
+    process.env.JOINER_KERNEL_TIMEOUT_MS = "150";
+    process.env.JOINER_KERNEL_ZOMBIE_MS = "400";
+    const hangApi = {
+      ...GroupApi,
+      searchGroup() { return new Promise(() => {}); }, // 永久挂起
+    };
+    const ctxHang = {
+      pluginPath: PDIR,
+      logger: ctx.logger,
+      core: { apis: { GroupApi: hangApi, MsgApi }, context: { session } },
+    };
+    await plugin_init(ctxHang);
+    token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
+
+    const a = await rqRaw("/api/search", { group: "10000001" });
+    const b = await rqRaw("/api/search", { group: "10000002" });
+    assert.equal(a.status, 503, "超时应回 503");
+    assert.equal(b.status, 503, "超时应回 503");
+    const during = (await rq("/api/stats")).json.data;
+    assert.equal(during.kernelQueue.active, 2, "超时后底层仍未 settle，槽位暂时保留");
+    assert.equal(during.kernelQueue.zombies, 2, "两个挂死调用应被登记为僵尸");
+
+    const c = await rqRaw("/api/search", { group: "10000003" });
+    assert.equal(c.status, 503, "回收前新请求仍拿不到槽位（排队超时）");
+
+    await sleep(700); // 超过硬上限 400ms
+    const after = (await rq("/api/stats")).json.data;
+    assert.equal(after.kernelQueue.active, 0, "僵尸槽位必须在硬上限后回收");
+    assert.equal(after.kernelQueue.zombies, 0, "僵尸集合应清空");
+    assert.ok(after.kernelZombies >= 2, "回收次数应被计数，实际 " + after.kernelZombies);
+
+    // 回收后换回正常内核：插件应恢复可用，不再需要重启
+    await plugin_cleanup();
+    delete process.env.JOINER_KERNEL_TIMEOUT_MS;
+    delete process.env.JOINER_KERNEL_ZOMBIE_MS;
+    await plugin_init(ctx);
+    token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
+    state.search.mode = "ok";
+    state.searchDelay = 0;
+    const ok = await rq("/api/search", { method: "POST", body: { group: "10000001" } });
+    assert.equal(ok.status, 200, "回收后插件应恢复正常，实际 " + ok.status);
+    await plugin_cleanup();
   });
 });

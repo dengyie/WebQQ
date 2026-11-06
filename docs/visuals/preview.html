@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebQQ 全链路修复总览（v1.6.2 评审可视化）</title>
+<style>
+  body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#F7F4EE;color:#1E2430}
+  .head{padding:36px 48px 20px;max-width:1160px;margin:0 auto}
+  .head h1{margin:0 0 8px;font-size:26px;letter-spacing:1px}
+  .head p{margin:0;color:#66707E;font-size:15px}
+  .grid{max-width:1160px;margin:0 auto;padding:0 48px 48px;display:grid;gap:28px}
+  .card{background:#fff;border:1px solid #D9D2C5;border-radius:16px;overflow:hidden}
+  .card .title{padding:18px 24px 0;font-size:17px;font-weight:700}
+  .card .sub{padding:6px 24px 14px;font-size:13px;color:#8B94A1}
+  .card img{display:block;width:100%;height:auto}
+  a{color:#3E6B9E}
+  .dl{max-width:1160px;margin:0 auto;padding:0 48px 60px;color:#66707E;font-size:14px}
+</style>
+</head>
+<body>
+<div class="head">
+  <h1>webqq 全链路修复总览 · v1.6.2</h1>
+  <p>根因修复 → 本地回归 → 线上部署与 smoke → 按结果迭代。三张图对应评审结论、修复后链路、逐项验收点。</p>
+</div>
+<div class="grid">
+  <div class="card">
+    <div class="title">01 · 修复总览</div>
+    <div class="sub">请求面 / 内核闸门 / 落盘与自愈 —— 三个安全边界各自收敛。</div>
+    <img src="overview.svg" alt="修复总览">
+  </div>
+  <div class="card">
+    <div class="title">02 · 修复后的关键链路</div>
+    <div class="sub">从入口到 NapCat，再到落盘与系统自愈；核心不变量是槽位只随底层 promise settle 释放。</div>
+    <img src="architecture.svg" alt="关键链路">
+  </div>
+  <div class="card">
+    <div class="title">03 · 修复清单与验收点</div>
+    <div class="sub">每一项对应一个可复现的失败路径与一条回归断言（P1/P2/P3）。</div>
+    <img src="findings.svg" alt="修复清单">
+  </div>
+</div>
+<div class="dl">
+  SVG 源文件：<a href="overview.svg">overview.svg</a> · <a href="architecture.svg">architecture.svg</a> · <a href="findings.svg">findings.svg</a>（可直接嵌入文档 / 演示）。
+</div>
+</body>
+</html>

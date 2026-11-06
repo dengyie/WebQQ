@@ -15,10 +15,22 @@ const SRC = path.join(here, "..", "napcat", "plugins", "napcat-plugin-joiner");
 const PDIR = "/tmp/joiner-mock/plugin";
 const PORT = 19001;
 
-// 清掉上一次残留的监听进程（端口占用是这类本地回归最常见的假失败）
+// 清掉上一次残留的监听进程（端口占用是这类本地回归最常见的假失败）。
+// 只杀 node 进程：19001 在生产上可能是 docker-proxy，误杀会中断线上端口转发。
+// 没有 lsof 时不要静默继续——否则失败会呈现为莫名其妙的 EADDRINUSE。
 function freePort() {
   const r = spawnSync("lsof", ["-nP", `-iTCP:${PORT}`, "-sTCP:LISTEN", "-t"], { encoding: "utf8" });
+  if (r.error) {
+    console.log(`警告：没有可用的 lsof，无法清理 :${PORT} 的残留监听；若本段失败请手动检查端口`);
+    return;
+  }
   for (const pid of (r.stdout || "").split(/\s+/).filter(Boolean)) {
+    const p = spawnSync("ps", ["-p", pid, "-o", "comm="], { encoding: "utf8" });
+    const comm = String(p.stdout || "").trim();
+    if (!/node/i.test(comm)) {
+      console.log(`警告：:${PORT} 被非 node 进程占用（pid=${pid} ${comm || "?"}），不杀它，跳过`);
+      continue;
+    }
     try { process.kill(Number(pid), "SIGKILL"); } catch { /* 已退出 */ }
   }
 }
@@ -41,19 +53,23 @@ for (const f of ["index.mjs", "page.html", "package.json"]) {
 }
 
 const results = [];
-results.push(["mock 回归", step("mock 回归（36 用例）", path.join(here, "mock.test.mjs"),
-  ["--test", "--test-force-exit", "--test-timeout=30000", "--test-reporter=spec"],
+results.push(["mock 回归", step("mock 回归（42 用例）", path.join(here, "mock.test.mjs"),
+  ["--test", "--test-force-exit", "--test-timeout=120000", "--test-reporter=spec"],
   { JOINER_DIR: PDIR })]);
 results.push(["竞态取证", step("竞态取证（race-check）", path.join(here, "race-check.mjs"), [], { JOINER_SRC: SRC })]);
 results.push(["排队取证", step("排队取证（queue-check）", path.join(here, "queue-check.mjs"), [], { JOINER_SRC: SRC })]);
+results.push(["超时取证", step("超时取证（timeout-check）", path.join(here, "timeout-check.mjs"), [], { JOINER_SRC: SRC })]);
 
-// 重登策略是 Python：有 python3 就跑，没有就明说跳过（不假装通过）
+// 重登策略是 Python：默认必须真跑。只有显式 ALLOW_PY_SKIP=1 才允许跳过，
+// 否则「本机没装 python3」会被当成通过，等于静默丢掉一段回归。
 const py = spawnSync("python3", ["-c", "print(1)"], { encoding: "utf8" });
 if (py.status === 0) {
   results.push(["重登策略", step("重登策略（relogin-check）", path.join(here, "relogin-check.py"), [], {}, "python3")]);
 } else {
-  console.log("\n=== 重登策略（relogin-check）===\n跳过：本机没有 python3");
-  results.push(["重登策略", true]);
+  const allowSkip = process.env.ALLOW_PY_SKIP === "1";
+  console.log("\n=== 重登策略（relogin-check）===\n" +
+    (allowSkip ? "跳过：本机没有 python3（ALLOW_PY_SKIP=1）" : "失败：本机没有 python3；如需临时跳过请设 ALLOW_PY_SKIP=1"));
+  results.push(["重登策略", allowSkip]);
 }
 
 console.log("\n=== 汇总 ===");
