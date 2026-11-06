@@ -115,7 +115,7 @@ function rqRaw(p, body, tok = token) {
   });
 }
 
-test("napcat-plugin-joiner v1.5.0 mock 回归", async (t) => {
+test("napcat-plugin-joiner v1.6.0", async (t) => {
   const { plugin_init, plugin_cleanup } = await import(path.join(PDIR, "index.mjs"));
   await plugin_init(ctx);
   token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
@@ -524,6 +524,29 @@ test("napcat-plugin-joiner v1.5.0 mock 回归", async (t) => {
     assert.ok(d.cache.groupsHit > 0, "应有缓存命中记录");
     assert.equal(typeof d.authFailures, "number", "应暴露鉴权失败计数");
     assert.equal(typeof d.joinDedup, "number", "应暴露加群去重计数");
+  });
+
+  await t.test("路由级延迟：/api/search 变慢体现在 p99，不再只看得到全局均值", async () => {
+    const before = (await rq("/api/stats")).json.data.latencyMs;
+    assert.ok(before["/api/groups"], "/api/groups 被测过，应有延迟样本");
+    const g0 = before["/api/groups"];
+
+    state.searchDelay = 700; // 只拖慢 search，groups 不受影响
+    for (let i = 0; i < 3; i++) await rq("/api/search", { method: "POST", body: { group: "70000" + i } });
+    state.searchDelay = 0;
+
+    await rq("/api/groups", { method: "POST", body: {} }); // 让 groups 也产生一个新样本
+    await sleep(30); // finish 事件在响应体写完后触发
+    const after = (await rq("/api/stats")).json.data.latencyMs;
+    const s1 = after["/api/search"];
+    assert.ok(s1.n >= 3, "search 样本应累积，实际 n=" + s1.n);
+    assert.ok(s1.p99 >= 600, "慢请求必须体现在 p99，实际 " + s1.p99 + "ms");
+    assert.ok(s1.max >= 600, "max 应记录最慢一次");
+    assert.ok(typeof s1.p50 === "number" && s1.p50 <= s1.p99, "p50 ≤ p99");
+
+    const g1 = after["/api/groups"];
+    assert.ok(g1.n > g0.n, "groups 调用数应同步增长");
+    assert.ok(g1.p99 < 300, "别的路由不应被 search 的慢拖累，实际 " + g1.p99 + "ms");
   });
 
   await t.test("历史：写入合并落盘，环形上限 200 不被突破", async () => {

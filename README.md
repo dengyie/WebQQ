@@ -4,7 +4,7 @@
 
 项目由我们自己开发和维护：插件、页面、运维脚本、回归测试都在本仓库，**不含任何第三方源码**。NapCat 只是运行平台（第三方 Docker 镜像），OneBot v11 是它对外暴露的协议。
 
-当前版本：**v1.5.0**
+当前版本：**v1.6.0**
 
 ## 功能
 
@@ -26,7 +26,8 @@
 - 内核并发闸门：`GroupApi` / `MsgApi` 同时最多 2 个在跑，其余排队；**队列有界**——上限 8 个、单次排队最长 10s，满了/超时立刻 503，不会堆成几分钟的积压（客户端早断了内核还在干活）
 - 群列表缓存带**代际**：在途请求回来时代际已变就不回填，避免退群后仍显示旧列表
 - 历史落盘串行化（promise 链 + cleanup 先 await 再同步写），不会旧快照覆盖新快照
-- `/api/stats`：**按实例统计**（插件热重载后自动归零，直方图 `reset()`，不再继承上一次的尖峰）；请求/路由/内核/缓存命中/错误/事件循环延迟与窗口/RSS/去重计数/队列水位与拒绝次数
+- `/api/stats`：**按实例统计**（插件热重载后自动归零，直方图 `reset()`，不再继承上一次的尖峰）；请求/路由/内核/缓存命中/错误/事件循环延迟与窗口/**路由级延迟 p50/p99/max**（每条路由保留最近 64 个样本）/RSS/去重计数/队列水位与拒绝次数
+- `npm test` 单入口把头五个回归打成一条命令：自动拷一份最新插件到临时目录、清端口占用，再依次跑 mock 套件 + `race-check` + `queue-check`，任何一段失败退出码非 0
 - 页面与口令走 `fs.watchFile` 热更新（500ms），改文件即生效，无需重启容器
 
 ## 目录
@@ -42,9 +43,10 @@ napcat/plugins/
   napcat-plugin-joiner/         # ★ 群操作台：index.mjs + page.html（自研）
   sk-join-group/                # 一次性：主动申请加入指定群
 tests/
-  mock.test.mjs                 # 33 用例：假内核 + 真 HTTP，不连 QQ
-  race-check.mjs                # 加群去重的独立取证脚本
-  queue-check.mjs               # 有界内核队列的独立取证脚本
+  mock.test.mjs                 # 36 用例：假内核 + 真 HTTP，不连 QQ
+  race-check.mjs                # 加群去重的独立取证脚本（JOINER_SRC 可指定源码）
+  queue-check.mjs               # 有界内核队列的独立取证脚本（JOINER_SRC 可指定源码）
+  run-all.mjs                   # npm test 入口：拷插件 + 三连跑
   port-check.mjs                # cleanup 关端口 / 二次 init
   timer-old.mjs / timer-new.mjs # withTimeout 定时器泄漏对照
   README.md                     # 测试说明与历史回归锚点
@@ -80,16 +82,16 @@ cat napcat/plugins/napcat-plugin-joiner/token
 ## 测试
 
 ```bash
-cd tests
-lsof -nP -iTCP:19001 -sTCP:LISTEN -t | xargs -r kill -9   # 先清占用
-JOINER_DIR=../napcat/plugins/napcat-plugin-joiner \
-  node --test --test-force-exit --test-timeout=30000 --test-reporter=spec mock.test.mjs
+npm test                 # 一条命令：拷插件 + mock 36 用例 + race-check + queue-check
 
-node race-check.mjs      # 并发加群取证：应为 reqToJoinGroup = 1，退出码 0
-node queue-check.mjs     # 有界队列取证：排队超时 503 + 槽位不泄漏，RESULT=OK
+# 或分段跑（调试时更直观）：
+JOINER_DIR=../napcat/plugins/napcat-plugin-joiner \
+  node --test --test-force-exit --test-timeout=30000 --test-reporter=spec tests/mock.test.mjs
+node tests/race-check.mjs
+node tests/queue-check.mjs
 ```
 
-35/35 全绿，总时长约 23s。回归锚点（旧版本应当红）见 `tests/README.md`。
+36/36 全绿，加上两个取证脚本共 3 段，总时长约 30s。回归锚点（旧版本应当红）见 `tests/README.md`。
 
 ## 上游与致谢
 

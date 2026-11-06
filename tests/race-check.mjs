@@ -2,9 +2,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const PDIR = "/tmp/joiner-mock/plugin";
+// 源码目录默认取仓库里的插件，可用 JOINER_SRC 覆盖（与 queue-check 保持一致）
+const SRC = process.env.JOINER_SRC || new URL("../napcat/plugins/napcat-plugin-joiner", import.meta.url).pathname;
+const PDIR = "/tmp/joiner-mock/race-plugin";
+fs.rmSync(PDIR, { recursive: true, force: true });
+fs.mkdirSync(PDIR, { recursive: true });
 for (const f of ["index.mjs", "page.html", "package.json"]) {
-  fs.copyFileSync(path.join("/tmp/qq-joiner", f), path.join(PDIR, f));
+  fs.copyFileSync(path.join(SRC, f), path.join(PDIR, f));
 }
 fs.writeFileSync(path.join(PDIR, "history.json"), "", { mode: 0o600 });
 

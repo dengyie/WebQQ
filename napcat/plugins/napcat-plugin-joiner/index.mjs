@@ -268,6 +268,16 @@ export async function plugin_init(ctx) {
   //     客户端早就断了，内核还在为没人要的结果干活；
   //   - 排队上限 10s：到点丢出队列并 503，绝不占着槽位；
   //   - 队列里的等待者可以被后续的 handoff 跳过（已超时/已取消），不会占着坑。
+  // 路由延迟：每条路由保留最近 64 个样本，/api/stats 里算 p50/p99/max。
+  // 只用一个短环形数组——排查「慢在哪条路由」够用，且不引第三方直方图依赖。
+  const LAT_SAMPLES = 64;
+  const latency = Object.create(null); // routeKey -> { n, samples: [] }
+  function pct(sorted, q) {
+    if (!sorted.length) return null;
+    const i = Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))));
+    return +sorted[i].toFixed(2);
+  }
+
   const KERNEL_MAX = 2;
   const KERNEL_QUEUE_MAX = Math.max(1, Number(process.env.JOINER_KERNEL_QUEUE_MAX || 8));
   const KERNEL_WAIT_MS = Math.max(50, Number(process.env.JOINER_KERNEL_WAIT_MS || 10000));
@@ -564,6 +574,14 @@ export async function plugin_init(ctx) {
     STATS.requests++;
     const routeKey = p.startsWith("/api/") ? p : (p === "/" || p.endsWith(".html") ? "/" : "other");
     STATS.routes[routeKey] = (STATS.routes[routeKey] || 0) + 1;
+    const t0 = process.hrtime.bigint();
+    res.once("finish", () => {
+      let e = latency[routeKey];
+      if (!e) e = latency[routeKey] = { n: 0, samples: [] };
+      e.n++;
+      e.samples.push(Number(process.hrtime.bigint() - t0) / 1e6);
+      if (e.samples.length > LAT_SAMPLES) e.samples.shift();
+    });
 
     try {
       const ip = clientIp(req);
@@ -633,6 +651,10 @@ export async function plugin_init(ctx) {
           eventLoopDelayMs: { mean: ms(el.mean), p50: ms(el.percentile(50)), p99: ms(el.percentile(99)), max: ms(el.max) },
           eventLoopWindowMs: histSince ? Date.now() - histSince : null,
           kernelQueue: { waiting: kernelWaiters.length, rejected: kernelQueueRejected, timeout: kernelQueueTimeout },
+          latencyMs: Object.fromEntries(Object.entries(latency).map(([k, v]) => {
+            const sorted = [...v.samples].sort((a, b) => a - b);
+            return [k, { n: v.n, p50: pct(sorted, 0.5), p99: pct(sorted, 0.99), max: pct(sorted, 1) }];
+          })),
           rssMB: +(process.memoryUsage().rss / 1048576).toFixed(1),
           historyInMemory: hload().length,
         } });
