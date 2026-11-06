@@ -99,6 +99,7 @@ let SRV = null;
 let STOP_WATCHES = [];
 const STATS = { startedAt: Date.now(), requests: 0, routes: {}, kernel: {}, groupsHit: 0, groupsMiss: 0, errors: 0, authFailures: 0, joinDedup: 0 };
 const eventLoopHist = monitorEventLoopDelay({ resolution: 20 });
+let histSince = 0; // 本实例直方图的起点（reset 时刻），用于 /api/stats 说明统计窗口
 let PLUGIN_DIR = "";
 let hbuf = null;      // null = 尚未从磁盘载入
 let hTimer = null;
@@ -179,8 +180,19 @@ export async function plugin_init(ctx) {
   loadPage();
   loadToken();
 
-  // 事件循环延迟直方图：不开 enable 的话读出来是空值（NaN→null），指标等于没有
+  // 统计口径 = 当前实例：热重载后 requests/kernel/uptime 一起归零。
+  // （限流 buckets 与鉴权失败表故意不重置——重载不该成为绕过限流或解锁 IP 的手段。）
+  Object.assign(STATS, {
+    startedAt: Date.now(), requests: 0, routes: {}, kernel: {},
+    groupsHit: 0, groupsMiss: 0, errors: 0, authFailures: 0, joinDedup: 0,
+  });
+
+  // 事件循环延迟直方图：不开 enable 的话读出来是空值（NaN→null），指标等于没有。
+  // reset()：插件热重载后清掉上一实例的样本——否则 /api/stats 的 max 会一直带着上次的尖峰，
+  // 让人误以为当前实例有问题。
+  eventLoopHist.reset();
   eventLoopHist.enable();
+  histSince = Date.now();
 
   STOP_WATCHES = [];
   function watchReload(file, reload, label) {
@@ -249,20 +261,73 @@ export async function plugin_init(ctx) {
 
 
   // 内核并发闸门：search/join/leave/send 都压 NapCat 主线程的 NTEvent，
-  // 小时级限流管不住「同时几个」。这里最多 2 个并发，其余排队，超时仍各自生效。
+  // 小时级限流管不住「同时几个」。这里最多 2 个并发，其余排队。
+  //
+  // v1.5.0 把「无界排队」改成有界：
+  //   - 队列上限 8：满了直接 503，不堆栈——否则几十个请求会排成几分钟的积压，
+  //     客户端早就断了，内核还在为没人要的结果干活；
+  //   - 排队上限 10s：到点丢出队列并 503，绝不占着槽位；
+  //   - 队列里的等待者可以被后续的 handoff 跳过（已超时/已取消），不会占着坑。
   const KERNEL_MAX = 2;
+  const KERNEL_QUEUE_MAX = Math.max(1, Number(process.env.JOINER_KERNEL_QUEUE_MAX || 8));
+  const KERNEL_WAIT_MS = Math.max(50, Number(process.env.JOINER_KERNEL_WAIT_MS || 10000));
   let kernelActive = 0;
-  const kernelWaiters = [];
+  let kernelQueueRejected = 0; // 队列满直接拒
+  let kernelQueueTimeout = 0;  // 排队等到超时
+  const kernelWaiters = []; // { grant, timer, cancelled }
+
+  function kernelBusy(msg, extra) {
+    const e = new Error(msg);
+    e.statusCode = 503;
+    e.busy = true;
+    return Object.assign(e, extra || {});
+  }
+
+  // 交出槽位：有活着的等待者就「转交」（active 不变，槽位没消失），
+  // 没人接手才真正释放（active--）。写反了会让 active 变负、闸门形同虚设——
+  // 这也是 v1.5.0 第一版被 12 并发用例逮到的地方。
+  function kernelHandoff() {
+    while (kernelWaiters.length) {
+      const w = kernelWaiters.shift();
+      if (w.cancelled) continue;
+      w.cancelled = true;
+      if (w.timer) { clearTimeout(w.timer); w.timer = null; }
+      w.grant();
+      return;
+    }
+    kernelActive--;
+  }
+
+  async function kernelAcquire() {
+    if (kernelActive < KERNEL_MAX) { kernelActive++; return; }
+    if (kernelWaiters.length >= KERNEL_QUEUE_MAX) {
+      kernelQueueRejected++;
+      throw kernelBusy("内核繁忙（排队已满），请稍后重试", { queueFull: true });
+    }
+    await new Promise((resolve, reject) => {
+      const w = {
+        cancelled: false,
+        timer: null,
+        grant: () => resolve(),
+      };
+      w.timer = setTimeout(() => {
+        if (w.cancelled) return;
+        w.cancelled = true;
+        const i = kernelWaiters.indexOf(w);
+        if (i >= 0) kernelWaiters.splice(i, 1);
+        kernelQueueTimeout++;
+        reject(kernelBusy("内核排队超时，请稍后重试", { queueTimeout: true }));
+      }, KERNEL_WAIT_MS);
+      if (typeof w.timer.unref === "function") w.timer.unref();
+      kernelWaiters.push(w);
+    });
+  }
+
   async function kernelCall(label, fn) {
-    while (kernelActive >= KERNEL_MAX) await new Promise((r) => kernelWaiters.push(r));
-    kernelActive++;
+    await kernelAcquire(); // 超时/队列满都在这里抛 503，未拿到槽位就不会进 try
     STATS.kernel[label] = (STATS.kernel[label] || 0) + 1;
     try { return await fn(); }
-    finally {
-      kernelActive--;
-      const next = kernelWaiters.shift();
-      if (next) next();
-    }
+    finally { kernelHandoff(); }
   }
 
   async function doSearch(keyword) {
@@ -272,8 +337,8 @@ export async function plugin_init(ctx) {
     try {
       searched = await kernelCall("searchGroup", () => withTimeout(Promise.resolve(groupApi.searchGroup(String(keyword).trim())), 15000, "searchGroup"));
     } catch (e) {
-      // 配置/能力问题要原样上抛（500），只有内核超时才翻成友好文案
-      if (/unavailable/i.test(String(e?.message || ""))) throw e;
+      // 配置/能力问题要原样上抛（500），容量问题要保留 503，只有内核超时才翻成友好文案
+      if (e?.busy || /unavailable/i.test(String(e?.message || ""))) throw e;
       throw new Error("群号不存在或搜索超时，请稍后重试");
     }
     const info = [searched?.searchGroupInfo, searched?.data?.searchGroupInfo, searched?.data, searched]
@@ -566,6 +631,8 @@ export async function plugin_init(ctx) {
           joinDedup: STATS.joinDedup,
           authBlockedIps: authFails.size,
           eventLoopDelayMs: { mean: ms(el.mean), p50: ms(el.percentile(50)), p99: ms(el.percentile(99)), max: ms(el.max) },
+          eventLoopWindowMs: histSince ? Date.now() - histSince : null,
+          kernelQueue: { waiting: kernelWaiters.length, rejected: kernelQueueRejected, timeout: kernelQueueTimeout },
           rssMB: +(process.memoryUsage().rss / 1048576).toFixed(1),
           historyInMemory: hload().length,
         } });
@@ -577,7 +644,11 @@ export async function plugin_init(ctx) {
         const fresh = groupsFresh();
         if (fresh) STATS.groupsHit++; else STATS.groupsMiss++;
         if (!fresh && !rate("search")) { send(res, 429, { ok: false, error: "rate limited" }); return; }
-        send(res, 200, { ok: true, data: await doListGroups() });
+        try {
+          send(res, 200, { ok: true, data: await doListGroups() });
+        } catch (e) {
+          send(res, e.statusCode || 500, { ok: false, error: String(e.message || e) });
+        }
         return;
       }
 
@@ -593,10 +664,14 @@ export async function plugin_init(ctx) {
           const kw = String(body.group || "").trim();
           if (!isDigits(kw)) { send(res, 400, { ok: false, error: "group 需要是群号数字" }); return; }
           if (!rate("search")) { send(res, 429, { ok: false, error: "rate limited" }); return; }
-          const info = await doSearch(kw);
-          if (!info) { send(res, 404, { ok: false, error: "搜不到该群" }); return; }
-          recordHistory("search", kw, info.groupName, "ok");
-          send(res, 200, { ok: true, data: info });
+          try {
+            const info = await doSearch(kw);
+            if (!info) { send(res, 404, { ok: false, error: "搜不到该群" }); return; }
+            recordHistory("search", kw, info.groupName, "ok");
+            send(res, 200, { ok: true, data: info });
+          } catch (e) {
+            send(res, e.statusCode || 500, { ok: false, error: String(e.message || e) });
+          }
           return;
         }
 
@@ -623,7 +698,7 @@ export async function plugin_init(ctx) {
             const r = await doLeave(group, dryRun);
             send(res, 200, { ok: true, data: r });
           } catch (e) {
-            send(res, 500, { ok: false, error: String(e.message || e) });
+            send(res, e.statusCode || 500, { ok: false, error: String(e.message || e) });
           }
           return;
         }
@@ -648,7 +723,7 @@ export async function plugin_init(ctx) {
       send(res, 404, { ok: false, error: "not found" });
     } catch (e) {
       STATS.errors++;
-      send(res, 500, { ok: false, error: String(e?.message || e) });
+      send(res, e?.statusCode || 500, { ok: false, error: String(e?.message || e) });
     }
   });
 

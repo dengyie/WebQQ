@@ -4,7 +4,7 @@
 
 项目由我们自己开发和维护：插件、页面、运维脚本、回归测试都在本仓库，**不含任何第三方源码**。NapCat 只是运行平台（第三方 Docker 镜像），OneBot v11 是它对外暴露的协议。
 
-当前版本：**v1.4.0**
+当前版本：**v1.5.0**
 
 ## 功能
 
@@ -23,10 +23,10 @@
 - 响应头统一 `no-store / noindex / no-referrer / nosniff / X-Frame-Options: DENY`
 
 **工程**
-- 内核并发闸门：`GroupApi` / `MsgApi` 同时最多 2 个在跑，其余排队
+- 内核并发闸门：`GroupApi` / `MsgApi` 同时最多 2 个在跑，其余排队；**队列有界**——上限 8 个、单次排队最长 10s，满了/超时立刻 503，不会堆成几分钟的积压（客户端早断了内核还在干活）
 - 群列表缓存带**代际**：在途请求回来时代际已变就不回填，避免退群后仍显示旧列表
 - 历史落盘串行化（promise 链 + cleanup 先 await 再同步写），不会旧快照覆盖新快照
-- `/api/stats`：请求/路由/内核/缓存命中/错误/事件循环延迟/RSS/去重计数
+- `/api/stats`：**按实例统计**（插件热重载后自动归零，直方图 `reset()`，不再继承上一次的尖峰）；请求/路由/内核/缓存命中/错误/事件循环延迟与窗口/RSS/去重计数/队列水位与拒绝次数
 - 页面与口令走 `fs.watchFile` 热更新（500ms），改文件即生效，无需重启容器
 
 ## 目录
@@ -44,6 +44,7 @@ napcat/plugins/
 tests/
   mock.test.mjs                 # 33 用例：假内核 + 真 HTTP，不连 QQ
   race-check.mjs                # 加群去重的独立取证脚本
+  queue-check.mjs               # 有界内核队列的独立取证脚本
   port-check.mjs                # cleanup 关端口 / 二次 init
   timer-old.mjs / timer-new.mjs # withTimeout 定时器泄漏对照
   README.md                     # 测试说明与历史回归锚点
@@ -71,6 +72,8 @@ cat napcat/plugins/napcat-plugin-joiner/token
 | `MESH_IP` | 端口发布到哪个地址（内网/mesh 入口） | `127.0.0.1` |
 | `JOINER_ALLOW_HOSTS` | 同源之外额外允许的 Host，逗号分隔 | `qq.example.com` |
 | `TARGET_GROUP` | `sk-join-group` / `sk-invite-accept.py` 的目标群号 | 空（不动作） |
+| `JOINER_KERNEL_QUEUE_MAX` | 内核排队上限（超过即 503） | `8` |
+| `JOINER_KERNEL_WAIT_MS` | 单次排队最长等待（超时即 503） | `10000` |
 
 运行期还会用到（由程序自己生成，**不入库**）：插件目录下的 `token`、`history.json`，以及 `/opt/qq-bot` 下的 `.webui_token`、`.onebot_token`、`.qq_password`。
 
@@ -83,9 +86,10 @@ JOINER_DIR=../napcat/plugins/napcat-plugin-joiner \
   node --test --test-force-exit --test-timeout=30000 --test-reporter=spec mock.test.mjs
 
 node race-check.mjs      # 并发加群取证：应为 reqToJoinGroup = 1，退出码 0
+node queue-check.mjs     # 有界队列取证：排队超时 503 + 槽位不泄漏，RESULT=OK
 ```
 
-33/33 全绿，总时长约 21s。回归锚点（旧版本应当红）见 `tests/README.md`。
+35/35 全绿，总时长约 23s。回归锚点（旧版本应当红）见 `tests/README.md`。
 
 ## 上游与致谢
 

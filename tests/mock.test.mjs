@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 
 const PDIR = process.env.JOINER_DIR || "/tmp/joiner-mock/plugin";
@@ -87,7 +88,34 @@ async function rq(p, { method = "GET", body, tok = token, rawBody, cookie } = {}
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test("napcat-plugin-joiner v1.4.0 mock 回归", async (t) => {
+// fetch（undici）会按连接池限流，12 个并发实际只有 ~6 条连接同时在飞。
+// 验证「队列上限」必须用真并发：每个请求单开一条 socket（agent:false）。
+function rqRaw(p, body, tok = token) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request({
+      host: "127.0.0.1", port: 19001, path: p, method: "POST", agent: false,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+        "X-Joiner-Token": tok,
+      },
+    }, (res) => {
+      let d = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { d += c; });
+      res.on("end", () => {
+        let json = null;
+        try { json = JSON.parse(d); } catch {}
+        resolve({ status: res.statusCode, text: d, json });
+      });
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+test("napcat-plugin-joiner v1.5.0 mock 回归", async (t) => {
   const { plugin_init, plugin_cleanup } = await import(path.join(PDIR, "index.mjs"));
   await plugin_init(ctx);
   token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
@@ -466,6 +494,24 @@ test("napcat-plugin-joiner v1.4.0 mock 回归", async (t) => {
     assert.ok(state.maxSearchConcurrent >= 2, "应实际用到 2 个并发");
   });
 
+  await t.test("内核队列有界：排队满了立刻 503，不堆成几分钟积压", async () => {
+    state.searchDelay = 400;
+    const before = (await rq("/api/stats")).json.data.kernelQueue.rejected;
+    // 2 个在跑 + 队列上限 8 = 10 个能进，第 11/12 个必须被立刻拒
+    state.maxSearchConcurrent = 0;
+    const rs = await Promise.all(Array.from({ length: 12 }, (_, i) =>
+      rqRaw("/api/search", { group: String(710000 + i) })));
+    state.searchDelay = 0;
+    const busy = rs.filter((r) => r.status === 503);
+    const ok = rs.filter((r) => r.status === 200);
+    assert.ok(busy.length >= 1, "队列满应至少拒 1 个，实际状态：" + rs.map((r) => r.status).join(","));
+    assert.ok(ok.length >= 1, "已拿到槽位的请求仍应成功");
+    assert.match(busy[0].json.error, /繁忙/, "拒绝原因要说人话");
+    const after = (await rq("/api/stats")).json.data.kernelQueue.rejected;
+    assert.ok(after - before >= busy.length, "拒绝次数应被 /api/stats 统计");
+    assert.equal((await rq("/api/stats")).json.data.kernelQueue.waiting, 0, "排空后队列应归零");
+  });
+
   await t.test("/api/stats：请求/内核/缓存/事件循环指标可读", async () => {
     const r = await rq("/api/stats");
     assert.equal(r.status, 200);
@@ -495,6 +541,21 @@ test("napcat-plugin-joiner v1.4.0 mock 回归", async (t) => {
     await sleep(1200); // 让 history 合并定时器先落地
     const res = process.getActiveResourcesInfo();
     assert.ok(!res.includes("Timeout"), "不应存在未清理的 Timeout 句柄：" + JSON.stringify(res));
+  });
+
+  await t.test("重载后直方图窗口归零（不继承上一实例的尖峰）", async () => {
+    const a = (await rq("/api/stats")).json.data;
+    assert.ok(a.eventLoopWindowMs > 1000, "本实例窗口应已累积，实际 " + a.eventLoopWindowMs);
+
+    await plugin_cleanup();
+    await sleep(60);
+    await plugin_init(ctx);
+
+    const b = (await rq("/api/stats")).json.data;
+    assert.ok(b.eventLoopWindowMs < a.eventLoopWindowMs, "重载后统计窗口必须重新计时");
+    assert.ok(b.eventLoopWindowMs <= 2000, "新实例窗口应只有几十 ms，实际 " + b.eventLoopWindowMs);
+    assert.ok(b.uptimeMs <= 2000, "uptime 也应重置，实际 " + b.uptimeMs);
+    // 注意：这里故意不 cleanup —— 后面的「cleanup 释放端口」用例需要 server 活着
   });
 
   await t.test("plugin_cleanup 同步落盘并释放端口（可重复 init）", async () => {
