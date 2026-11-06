@@ -1,0 +1,21 @@
+# 常驻登录看门狗：由掉线检测触发重登（不再用 5 分钟定时器盲目跑）。
+# 部署：cp 到 /etc/systemd/system/ 后 systemctl enable --now qq-relogin-watch
+# 关掉旧定时器：systemctl disable --now qq-relogin.timer
+[Unit]
+Description=QQ login watchdog (relogin triggered by offline detection)
+After=docker.service qq-napcat.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/qq-bot/relogin-watch.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/qq-bot /tmp
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

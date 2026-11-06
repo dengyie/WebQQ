@@ -1,6 +1,6 @@
 {
   "name": "webqq",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "description": "NapCat OneBot v11 自研加群/搜群插件与运维脚本",
   "type": "module",

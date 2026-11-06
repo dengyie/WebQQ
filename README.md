@@ -4,7 +4,7 @@
 
 项目由我们自己开发和维护：插件、页面、运维脚本、回归测试都在本仓库，**不含任何第三方源码**。NapCat 只是运行平台（第三方 Docker 镜像），OneBot v11 是它对外暴露的协议。
 
-当前版本：**v1.6.0**
+当前版本：**v1.6.1**
 
 ## 功能
 
@@ -27,7 +27,7 @@
 - 群列表缓存带**代际**：在途请求回来时代际已变就不回填，避免退群后仍显示旧列表
 - 历史落盘串行化（promise 链 + cleanup 先 await 再同步写），不会旧快照覆盖新快照
 - `/api/stats`：**按实例统计**（插件热重载后自动归零，直方图 `reset()`，不再继承上一次的尖峰）；请求/路由/内核/缓存命中/错误/事件循环延迟与窗口/**路由级延迟 p50/p99/max**（每条路由保留最近 64 个样本）/RSS/去重计数/队列水位与拒绝次数
-- `npm test` 单入口把头五个回归打成一条命令：自动拷一份最新插件到临时目录、清端口占用，再依次跑 mock 套件 + `race-check` + `queue-check`，任何一段失败退出码非 0
+- `npm test` 单入口把全部回归打成一条命令：自动拷一份最新插件到临时目录、清端口占用，再依次跑 mock 套件 + `race-check` + `queue-check` + `relogin-check`，任何一段失败退出码非 0
 - 页面与口令走 `fs.watchFile` 热更新（500ms），改文件即生效，无需重启容器
 
 ## 目录
@@ -36,17 +36,22 @@
 compose.yml                     # NapCat 容器编排（端口、卷、日志轮转）
 .env.example                    # 需要自己填的配置
 patch-whitelist.sh              # 把本插件加进 NapCat 官方插件白名单（重建容器后必跑）
-login-status.py / relogin.py    # 登录状态查看 / 掉线账密重登
+login-status.py                 # 登录状态查看
+relogin.py                      # 掉线账密重登（一次性 CLI，也可被看门狗调用）
+relogin-watch.py                # 常驻看门狗：掉线检测触发重登（替代 5 分钟定时器）
 show-qr.sh                      # 打印/导出登录二维码
 sk-invite-accept.py             # 只接受指定一个群的邀请
 napcat/plugins/
   napcat-plugin-joiner/         # ★ 群操作台：index.mjs + page.html（自研）
   sk-join-group/                # 一次性：主动申请加入指定群
+systemd/
+  qq-relogin-watch.service    # 看门狗 unit（Type=simple + Restart=always）
 tests/
   mock.test.mjs                 # 36 用例：假内核 + 真 HTTP，不连 QQ
   race-check.mjs                # 加群去重的独立取证脚本（JOINER_SRC 可指定源码）
   queue-check.mjs               # 有界内核队列的独立取证脚本（JOINER_SRC 可指定源码）
-  run-all.mjs                   # npm test 入口：拷插件 + 三连跑
+  relogin-check.py              # 重登策略回归：假 WebUI 验退避/上限/恢复/验证码
+  run-all.mjs                   # npm test 入口：拷插件 + 四连跑
   port-check.mjs                # cleanup 关端口 / 二次 init
   timer-old.mjs / timer-new.mjs # withTimeout 定时器泄漏对照
   README.md                     # 测试说明与历史回归锚点
@@ -65,6 +70,21 @@ cat napcat/plugins/napcat-plugin-joiner/token
 
 浏览器打开 `http://<host>:19001/?token=<token>`：会 302 到不带口令的地址并种 cookie，之后直接用即可。
 
+## 掉线重登
+
+NapCat 掉线后不会自己回到登录态。这里不用定时器盲目轮询，而是**常驻看门狗检测到掉线才动作**：
+
+```bash
+systemctl disable --now qq-relogin.timer      # 关掉旧的 5 分钟定时器
+cp systemd/qq-relogin-watch.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now qq-relogin-watch
+```
+
+- `relogin-watch.py` 每 10s 读一次 `CheckLoginStatus`（本地 HTTP，<1ms；NapCat WebUI 自身也没有登录事件流），**只在登录态变化时打日志**；
+- 检测到离线 → 调 `relogin.tick()`：距上次尝试 ≥30 分钟才发起、单轮最多 3 次、滑块/新设备验证立即停止等人工；
+- 账密登录返回「成功」只代表请求被受理，**仍计一次尝试**并按 30 分钟退避——否则内核迟迟不回来时会被反复登录，直接撞风控；
+- 恢复登录后状态自动清空，下一次掉线重新计数；WebUI/容器不可达时只记一行、不尝试登录。
+
 ## 配置
 
 | 变量 | 作用 | 默认 |
@@ -76,13 +96,16 @@ cat napcat/plugins/napcat-plugin-joiner/token
 | `TARGET_GROUP` | `sk-join-group` / `sk-invite-accept.py` 的目标群号 | 空（不动作） |
 | `JOINER_KERNEL_QUEUE_MAX` | 内核排队上限（超过即 503） | `8` |
 | `JOINER_KERNEL_WAIT_MS` | 单次排队最长等待（超时即 503） | `10000` |
+| `QQ_WATCH_INTERVAL` | 看门狗轮询登录态的间隔（秒） | `10` |
+| `QQ_RELOGIN_MIN_INTERVAL` | 两次账密重登的最小间隔（秒） | `1800` |
+| `QQ_RELOGIN_MAX_TRIES` | 单轮掉线最多尝试次数 | `3` |
 
 运行期还会用到（由程序自己生成，**不入库**）：插件目录下的 `token`、`history.json`，以及 `/opt/qq-bot` 下的 `.webui_token`、`.onebot_token`、`.qq_password`。
 
 ## 测试
 
 ```bash
-npm test                 # 一条命令：拷插件 + mock 36 用例 + race-check + queue-check
+npm test                 # 一条命令：拷插件 + mock 36 用例 + race-check + queue-check + relogin-check
 
 # 或分段跑（调试时更直观）：
 JOINER_DIR=../napcat/plugins/napcat-plugin-joiner \
@@ -91,7 +114,7 @@ node tests/race-check.mjs
 node tests/queue-check.mjs
 ```
 
-36/36 全绿，加上两个取证脚本共 3 段，总时长约 30s。回归锚点（旧版本应当红）见 `tests/README.md`。
+36/36 全绿 + 竞态/排队/重登三份取证，共 4 段，总时长约 30s。回归锚点（旧版本应当红）见 `tests/README.md`。
 
 ## 上游与致谢
 

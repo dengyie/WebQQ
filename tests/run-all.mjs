@@ -1,4 +1,4 @@
-// 一条命令跑完全部回归：mock 套件 + 竞态取证 + 排队取证。
+// 一条命令跑完全部回归：mock 套件 + 竞态取证 + 排队取证 + 重登策略。
 // 用法：npm test   或   node tests/run-all.mjs
 //
 // 为什么需要这一层：
@@ -23,10 +23,10 @@ function freePort() {
   }
 }
 
-function step(label, script, args, env) {
+function step(label, script, args, env, bin) {
   freePort();
   console.log(`\n=== ${label} ===`);
-  const r = spawnSync(process.execPath, [script, ...args], {
+  const r = spawnSync(bin || process.execPath, [script, ...args], {
     stdio: "inherit",
     env: { ...process.env, ...env },
   });
@@ -46,6 +46,15 @@ results.push(["mock 回归", step("mock 回归（36 用例）", path.join(here, 
   { JOINER_DIR: PDIR })]);
 results.push(["竞态取证", step("竞态取证（race-check）", path.join(here, "race-check.mjs"), [], { JOINER_SRC: SRC })]);
 results.push(["排队取证", step("排队取证（queue-check）", path.join(here, "queue-check.mjs"), [], { JOINER_SRC: SRC })]);
+
+// 重登策略是 Python：有 python3 就跑，没有就明说跳过（不假装通过）
+const py = spawnSync("python3", ["-c", "print(1)"], { encoding: "utf8" });
+if (py.status === 0) {
+  results.push(["重登策略", step("重登策略（relogin-check）", path.join(here, "relogin-check.py"), [], {}, "python3")]);
+} else {
+  console.log("\n=== 重登策略（relogin-check）===\n跳过：本机没有 python3");
+  results.push(["重登策略", true]);
+}
 
 console.log("\n=== 汇总 ===");
 for (const [name, ok] of results) console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
