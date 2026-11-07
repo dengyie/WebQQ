@@ -415,7 +415,8 @@ test("napcat-plugin-joiner v1.6.4", async (t) => {
 
     state.search.mode = "throw";
     const er = await rq("/api/search", { method: "POST", body: { group: "888888888" } });
-    assert.equal(er.status, 500);
+    // v1.6.5 起：内核没给出可用答案是上游问题（502），不再落进兜底 500（插件 bug 信号）
+    assert.equal(er.status, 502);
     assert.match(er.json.error, /群号不存在或搜索超时/);
     assert.doesNotMatch(er.json.error, /NTEvent|Timeout:/);
     state.search.mode = "ok";

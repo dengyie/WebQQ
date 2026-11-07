@@ -489,9 +489,12 @@ export async function plugin_init(ctx) {
     try {
       searched = await kernelCall("searchGroup", () => groupApi.searchGroup(String(keyword).trim()), kernelTimeoutMs(15000), "searchGroup");
     } catch (e) {
-      // 配置/能力问题要原样上抛（500），容量/超时要保留 503，其余内核错误翻成友好文案
+      // 配置/能力问题要原样上抛（500），容量/自身超时要保留 503，其余内核错误翻成友好文案：
+      // 内核没给出可用答案是上游问题（502），不是插件缺陷，不该混进 500 的「插件 bug」信号里
       if (e?.busy || /unavailable/i.test(String(e?.message || ""))) throw e;
-      throw new Error("群号不存在或搜索超时，请稍后重试");
+      const friendly = new Error("群号不存在或搜索超时，请稍后重试");
+      friendly.statusCode = 502;
+      throw friendly;
     }
     const info = [searched?.searchGroupInfo, searched?.data?.searchGroupInfo, searched?.data, searched]
       .find((x) => x && typeof x === "object" && (x.groupCode != null || x.group_id != null)

@@ -8,6 +8,12 @@
   D. 24 并发 groups + 12 并发 search：有界队列语义（200 或 503）+ 排水后水位归零
   E. latencyMs 数值单调 p50<=p99<=max
   F. 4s TTL 内重复 groups 不额外消耗 search 配额
+  G. 响应头审计：200/401/404 都带 no-store 与安全头
+  H. 方法与状态矩阵：GET/POST 错配 404、未知路径带/不带口令 404/401
+  I. 边界输入：9KB body 413、空 body 400、非法 group 校验文案不回显
+  J. 内核错误语义：假群号不落 500（v1.6.5 起 502=上游，404=搜不到），文案不外泄内核原文
+  K. stats 深度字段：eventLoopDelayMs 五元组、rssMB/uptimeMs/cache/historyInMemory 合理
+  L. 轻量 soak：混合负载后队列归零、无新增超时/僵尸（RSS 漂移只打印不断言）
 
 公开仓库不入真实地址/账号，故：
   - 回环地址固定 127.0.0.1；受信代理源用 SMOKE_MESH（如 10.x.y.z）
@@ -131,13 +137,16 @@ print(f"24 并发 groups: {sum(gres)}/24 通过，耗时 {time.time()-t0:.2f}s")
 check("24 并发 groups 全 200", all(gres), str(gres))
 
 # 有界队列：排队上限默认 8，并发打满时超出部分必须快速 503（不是挂起、不是 500）。
-# 断言「全部落在 {200,503}」+「至少 2 个成功」+ 结束后水位归零。
+# 断言「全部落在 {200,503,429}」+「至少 2 个成功」+ 结束后水位归零。429 = 测试自身把
+# search 限流配额（120/h 滚动窗口）打满，属脚本连跑副作用而非回归；真正要抓的是
+# 500（插件 bug）与挂起。
 t1 = time.time()
 with ThreadPoolExecutor(12) as ex:
     scodes = list(ex.map(search_code, range(12)))
 dist = Counter(scodes)
 print(f"12 并发 search 状态分布: {dict(dist)}，耗时 {time.time()-t1:.2f}s")
-check("并发 search 全部为 200 或 503（无 500/挂起）", set(scodes) <= {200, 503}, str(scodes))
+check("并发 search 状态码健康（200/503/429，无 500/挂起）",
+      set(scodes) <= {200, 503, 429}, str(scodes))
 check("至少 2 个成功（内核确实在工作）", dist.get(200, 0) >= 2, str(dist))
 
 time.sleep(1)
@@ -169,6 +178,78 @@ for _ in range(3):
     ok_get("/api/groups")  # 必须带鉴权：无口令 401 不写配额，测不出配额变化
 r1 = stats()["rate"]["search"]
 check("4s TTL 内 3 次 groups 配额不增", r1 == r0, f"search {r0} -> {r1}")
+
+print("== G 响应头审计 ==")
+c, h, _ = raw("/api/groups", hdr={"X-Joiner-Token": TOK})
+for k in ("Cache-Control", "X-Robots-Tag", "Referrer-Policy",
+          "X-Content-Type-Options", "X-Frame-Options"):
+    check(f"200 带 {k}", h.get(k) is not None, str(h))
+check("200 Cache-Control=no-store", h.get("Cache-Control") == "no-store", h.get("Cache-Control"))
+_, h401, _ = raw("/api/groups")
+check("401 也带 no-store + DENY",
+      h401.get("Cache-Control") == "no-store" and h401.get("X-Frame-Options") == "DENY",
+      f"cc={h401.get('Cache-Control')} xfo={h401.get('X-Frame-Options')}")
+_, h404, _ = raw("/api/iter-nope-probe", hdr={"X-Joiner-Token": TOK})
+check("404 带 no-store", h404.get("Cache-Control") == "no-store", h404.get("Cache-Control"))
+
+print("== H 方法与状态矩阵 ==")
+c, _, _ = raw("/api/search", hdr={"X-Joiner-Token": TOK})
+check("GET /api/search -> 404（POST-only）", c == 404, f"code={c}")
+c, _, _ = raw("/api/groups", "POST", {"group": GROUP}, hdr={"X-Joiner-Token": TOK})
+check("POST /api/groups -> 404", c == 404, f"code={c}")
+c, _, _ = raw("/api/groups", method="OPTIONS", hdr={"X-Joiner-Token": TOK})
+check("OPTIONS -> 404（不开 CORS 预检面）", c == 404, f"code={c}")
+c, _, _ = raw("/api/iter-nope-probe", hdr={"X-Joiner-Token": TOK})
+check("未知路径带口令 -> 404", c == 404, f"code={c}")
+c, _, _ = raw("/api/iter-nope-probe")
+check("未知路径无口令 -> 401（鉴权前置；无口令不计爆破）", c == 401, f"code={c}")
+
+print("== I 边界输入 ==")
+c, _, _ = raw("/api/search", "POST", {"group": "x" * 9000}, hdr={"X-Joiner-Token": TOK})
+check("9KB body -> 413", c == 413, f"code={c}")
+c, _, _ = raw("/api/search", method="POST", hdr={"X-Joiner-Token": TOK})
+check("空 body POST -> 400", c == 400, f"code={c}")
+c, _, d = raw("/api/search", "POST", {"group": "<script>alert(1)</script>"},
+              hdr={"X-Joiner-Token": TOK})
+check("非法 group 校验文案且不回显 payload",
+      c == 400 and "<script" not in str(d), f"code={c} body={str(d)[:120]}")
+
+print("== J 内核错误语义（假群号，约 5s） ==")
+c, _, d = raw("/api/search", "POST", {"group": "9999999999"}, hdr={"X-Joiner-Token": TOK})
+check("假群号 ok:false 且不落 500（v1.6.5：502=上游没答案，404=确认搜不到）",
+      c in (404, 502) and isinstance(d, dict) and d.get("ok") is False, f"code={c} {str(d)[:160]}")
+check("错误文案不外泄内核原文", "NTEvent" not in str(d), str(d)[:160])
+
+print("== K stats 深度字段 ==")
+st = stats()
+el = st.get("eventLoopDelayMs") or {}
+check("eventLoopDelayMs 四元组数值有效",
+      all(isinstance(el.get(k), (int, float)) and el[k] >= 0 for k in ("mean", "p50", "p99", "max")),
+      str(el))
+check("eventLoopWindowMs 为正数", isinstance(st.get("eventLoopWindowMs"), (int, float))
+      and st["eventLoopWindowMs"] > 0, str(st.get("eventLoopWindowMs")))
+check("rssMB/uptimeMs 合理", isinstance(st.get("rssMB"), (int, float)) and st["rssMB"] > 0
+      and st.get("uptimeMs", 0) > 0, f"rss={st.get('rssMB')} up={st.get('uptimeMs')}")
+cache = st.get("cache") or {}
+check("cache 命中/未命中计数存在",
+      isinstance(cache.get("groupsHit"), int) and isinstance(cache.get("groupsMiss"), int), str(cache))
+check("historyInMemory 在环形上限内", isinstance(st.get("historyInMemory"), int)
+      and 0 <= st["historyInMemory"] <= 200, str(st.get("historyInMemory")))
+
+print("== L 轻量 soak（15 groups + 3 search） ==")
+s0 = stats()
+r0rss, t0, z0 = s0["rssMB"], s0["kernelTimeouts"], s0["kernelZombies"]
+for _ in range(3):
+    for _ in range(5):
+        ok_get("/api/groups")
+    search_code(0)
+time.sleep(1)
+s1 = stats()
+print(f"rssMB {r0rss} -> {s1['rssMB']}（GC 波动属正常，只观测）  kernelTimeouts {t0} -> {s1['kernelTimeouts']}")
+q1 = s1["kernelQueue"]
+check("soak 后队列归零", q1["active"] == 0 and q1["waiting"] == 0 and q1["zombies"] == 0, str(q1))
+check("soak 无新增超时/僵尸", s1["kernelTimeouts"] == t0 and s1["kernelZombies"] == z0,
+      f"timeouts {t0}->{s1['kernelTimeouts']} zombies {z0}->{s1['kernelZombies']}")
 
 print()
 if FAILS:
