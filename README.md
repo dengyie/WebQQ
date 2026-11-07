@@ -49,6 +49,10 @@ napcat/plugins/
   napcat-plugin-joiner/         # ★ 群操作台：index.mjs + page.html（自研）
 systemd/
   qq-relogin-watch.service    # 看门狗 unit（Type=simple + Restart=always）
+  cloudflared-watchdog.service  # 隧道看门狗 oneshot（配合 timer）
+  cloudflared-watchdog.timer    # 每 60s 跑一次隧道看门狗
+ops/
+  cloudflared-tunnel-watchdog.sh  # 隧道看门狗：metrics 优先/ss 回退，连续 3 轮 0 才重启
 tests/
   mock.test.mjs                 # 43 用例：假内核 + 真 HTTP，不连 QQ
   race-check.mjs                # 加群去重的独立取证脚本（JOINER_SRC 可指定源码）
@@ -99,6 +103,21 @@ systemctl daemon-reload && systemctl enable --now qq-relogin-watch
 - 检测到离线 → 调 `relogin.tick()`：距上次尝试 ≥30 分钟才发起、单轮最多 3 次、滑块/新设备验证立即停止等人工；
 - 账密登录返回「成功」只代表请求被受理，**仍计一次尝试**并按 30 分钟退避——否则内核迟迟不回来时会被反复登录，直接撞风控；
 - 恢复登录后状态自动清空，下一次掉线重新计数；WebUI/容器不可达时只记一行、不尝试登录。
+
+## 高可用
+
+线上已落地的自愈面，按故障域分：
+
+| 故障域 | 机制 |
+|---|---|
+| 插件/容器 | 有界队列 + 内核单调用超时 + 僵尸槽位回收（不重启自愈）；容器 `restart: unless-stopped`，宿主机重启自动回来 |
+| QQ 掉线 | `qq-relogin-watch` 常驻：10s 轮询登录态，掉线才动作，30 分钟退避防风控（见上节） |
+| 公网隧道 | `cloudflared-watchdog.timer`（60s）：优先读 connector 的 HA 指标（`--metrics` 仅环回），回退按 unit MainPID 数边缘连接，**连续 3 轮为 0 才重启**（宁漏判不误杀）；connector 配 `--ha-connections 8`，外加双连接器（另一台机器）兜底 |
+| 重启/重建 | `docker restart` 白名单补丁不丢（补丁在容器 FS）；**重建容器**后必须重跑 `patch-whitelist.sh` |
+
+部署看门狗（对齐同体系另一台机器的成熟模式）：`ops/cloudflared-tunnel-watchdog.sh` → `/usr/local/bin/`（700），`systemd/cloudflared-watchdog.{service,timer}` → `/etc/systemd/system/`，然后 `systemctl daemon-reload && systemctl enable --now cloudflared-watchdog.timer`。connector 的 `ExecStart` 需带 `--metrics 127.0.0.1:20242`（**同机多条隧道各用独立 metrics 端口**；脚本回退按 MainPID 过滤，不会把别的隧道的连接算进来）。演练击杀路径：`WATCHDOG_FALLBACK_CONNS=0 WATCHDOG_DRY_RUN=1` 连跑 3 次应见 `DRY_RUN: 将重启`。
+
+**口径提醒**：从 VPS 打自己的公网域名是发夹路径（VPS→CF 边缘→隧道→回 VPS），往返跨国，15–30% 单请求超时是链路常态，**不代表用户侧**（外部拨测 0.4–1.3s 全成功）。判断公网健康看 direct/mesh 或外部拨测，smoke 的 pub 行只作链路观测。
 
 ## 配置
 

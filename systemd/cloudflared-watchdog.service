@@ -1,0 +1,7 @@
+[Unit]
+Description=cloudflared tunnel watchdog (qq): restart connector when HA connections stay 0
+After=network-online.target cloudflared-qq.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cloudflared-tunnel-watchdog.sh
