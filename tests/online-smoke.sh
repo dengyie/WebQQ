@@ -32,6 +32,10 @@ echo "good-token direct:      $(code -H "$H" $D/api/groups)   # 期望 200"
 [ -n "$PUB" ] && echo "no-token pub:           $(code $PUB/api/groups)   # 期望 401" || echo "no-token pub:           (skip)"
 echo "note: pub 若出现 429，是本机出口 IP 已攒够鉴权失败（脚本连跑的正常后果），"
 echo "      不是故障；等窗口（JOINER_AUTH_FAIL_WINDOW_MS，默认 10min）过期再测。"
+echo "note: 从 VPS 打自己的公网域名是**发夹**路径（VPS -> CF 边缘 -> 隧道 -> 回 VPS），"
+echo "      往返都跨国，单请求常见 2–20s、部分直接超时（000）。这只反映 VPS 到边缘"
+echo "      的链路质量，不代表用户侧；外部网络直连同一地址实测 0.4–1.3s 全成功。"
+echo "      判断服务是否可用请看 direct / mesh 两行，pub 行只作链路观测。"
 
 echo "== 2 页面：header 直接回 HTML，含部署行与 send 标签 =="
 pg=$(curl -s -m 15 -H "$H" $D/joiner/)
@@ -54,10 +58,15 @@ echo "errors:               $err0 -> $err1   # 404 应使计数 +1"
 [ "$b" = "400" ] && [ "$err1" -gt "$err0" ] && echo "PASS 错误语义" || echo "FAIL 错误语义"
 
 echo "== 4 路由键基数（差值口径）：60 个杂乱路径只允许进有限键 =="
+# 必须打直连：公网隧道单请求可能 3–15s，串行 60 个会有大量 -m 4 超时，
+# 请求没落到插件就数不出真实键增量（曾因此误报「未汇总进 /api/other」）。
+# 公网只抽样 3 个，验证经隧道后路径同样被规范化。
 before=$(curl -s -m 15 -H "$H" $D/api/stats | jget 'json.dumps(d["routes"])')
-T=$D; [ -n "$PUB" ] && T=$PUB
-for i in $(seq 1 60); do curl -s -m 4 -o /dev/null -H "$H" $T/api/nope-$i; done
-code $T/api/nope-unauth >/dev/null   # 1 个未鉴权请求：证明未鉴权也写路由统计
+for i in $(seq 1 60); do curl -s -m 4 -o /dev/null -H "$H" $D/api/nope-$i; done
+code $D/api/nope-unauth >/dev/null   # 1 个未鉴权请求：证明未鉴权也写路由统计
+if [ -n "$PUB" ]; then
+  for i in 1 2 3; do curl -s -m 20 -o /dev/null -H "$H" $PUB/api/pub-nope-$i; done
+fi
 after=$(curl -s -m 15 -H "$H" $D/api/stats | jget 'json.dumps(d["routes"])')
 BEFORE="$before" AFTER="$after" python3 - <<'PY'
 import json, os
