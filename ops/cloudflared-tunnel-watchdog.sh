@@ -5,7 +5,7 @@
 # 信号优先级（宁可漏判不误杀）：
 #   1. cloudflared 自带 HA 指标（--metrics 仅环回）：cloudflared_tunnel_ha_connections
 #   2. 回退：按 unit MainPID 数本机到边缘 :7844 的连接。同机有多条隧道时不能全局数——
-#      别的隧道（如 balatro）常驻 4 条连接，会把「全断」误判成「健康」
+#      别的隧道常驻连接，会把「全断」误判成「健康」
 #   3. 两者都拿不到 → 跳过本轮
 # 连续 MAX_STRIKES 轮为 0 才 systemctl restart；健康即清零计数。
 # 部署：本脚本 -> /usr/local/bin/cloudflared-tunnel-watchdog.sh（root 700），
