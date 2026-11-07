@@ -121,7 +121,7 @@ function rqRaw(p, body, tok = token) {
   });
 }
 
-test("napcat-plugin-joiner v1.6.3", async (t) => {
+test("napcat-plugin-joiner v1.6.4", async (t) => {
   const { plugin_init, plugin_cleanup } = await import(path.join(PDIR, "index.mjs"));
   await plugin_init(ctx);
   token = fs.readFileSync(path.join(PDIR, "token"), "utf8").trim();
@@ -215,6 +215,23 @@ test("napcat-plugin-joiner v1.6.3", async (t) => {
     await sleep(2700);
     const unblocked = await fetch(B + "/api/groups", { headers: { "X-Joiner-Token": token, "cf-connecting-ip": IP } });
     assert.equal(unblocked.status, 200, "窗口过期后应自动解锁");
+  });
+
+  await t.test("无口令探测不计入爆破锁：40 次未带口令后同 IP 仍能正常鉴权", async () => {
+    // 只有「带了口令但不对」才是爆破特征。扫描器 / 健康检查 / 未鉴权运维探针
+    // 完全不带口令，回 401 就够——线上 smoke 曾因未鉴权路由探针把自己出口 IP
+    // 打成 429，逼得整轮测试要等窗口过期。
+    const IP = "203.0.113.10";
+    const before = (await rq("/api/stats")).json.data.authBlockedIps;
+    for (let i = 0; i < 40; i++) {
+      const r = await fetch(B + "/api/groups", { headers: { "cf-connecting-ip": IP } });
+      assert.equal(r.status, 401, "未带口令应 401 而不是 429（第 " + (i + 1) + " 次）");
+      await r.text();
+    }
+    const after = (await rq("/api/stats")).json.data.authBlockedIps;
+    assert.equal(after, before, "无口令探测不应产生封禁条目");
+    const ok = await fetch(B + "/api/groups", { headers: { "X-Joiner-Token": token, "cf-connecting-ip": IP } });
+    assert.equal(ok.status, 200, "40 次无口令后同 IP 仍可正常鉴权");
   });
 
   await t.test("口令热轮换：替换 token 文件后旧口令失效（watch 失效 + 内存缓存）", async () => {

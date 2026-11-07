@@ -53,7 +53,7 @@ for (const f of ["index.mjs", "page.html", "package.json"]) {
 }
 
 const results = [];
-results.push(["mock 回归", step("mock 回归（42 用例）", path.join(here, "mock.test.mjs"),
+results.push(["mock 回归", step("mock 回归（43 用例）", path.join(here, "mock.test.mjs"),
   ["--test", "--test-force-exit", "--test-timeout=120000", "--test-reporter=spec"],
   { JOINER_DIR: PDIR })]);
 results.push(["竞态取证", step("竞态取证（race-check）", path.join(here, "race-check.mjs"), [], { JOINER_SRC: SRC })]);

@@ -4,7 +4,7 @@
 
 项目由我们自己开发和维护：插件、页面、运维脚本、回归测试都在本仓库，**不含任何第三方源码**。NapCat 只是运行平台（第三方 Docker 镜像），OneBot v11 是它对外暴露的协议。
 
-当前版本：**v1.6.3**
+当前版本：**v1.6.4**
 
 ## 功能
 
@@ -17,7 +17,7 @@
 **安全**
 - 口令三种来源：首次 `?token=` → 种 `HttpOnly; SameSite=Lax` cookie（https 加 `Secure`，Path 收窄到插件前缀）→ 之后完全走 cookie，口令不再留在历史/书签/Referer；**高优先级来源错了不短路低优先级**（旧书签的过期 query token 不会压过有效 cookie/header），页面残留过期 token 会 302 到干净地址
 - cookie 来源的 POST 做 **CSRF 同源校验**（`Origin.host === Host`，另可用 `JOINER_ALLOW_HOSTS` 追加反代域名）
-- 同 IP 鉴权失败 20 次 / 10 分钟 → 429 锁定（**锁定可过期**，成功即销账）
+- 同 IP **带错口令**失败 20 次 / 10 分钟 → 429 锁定（**锁定可过期**，成功即销账；完全不带口令的探测只回 401、不累计不锁 IP，运维/健康检查不会被自己锁死）
 - 限流：加群 10 次/小时、发消息 20 次/小时，且只在会产生外部副作用的路径上消耗配额；群列表按属性共享 search 配额（命中缓存 / 已有在途请求不再计）
 - 审计历史（内存环形 200 条 + 合并落盘，**写失败计数并限频告警**），页面可查 `/api/history`
 - 响应头统一 `no-store / noindex / no-referrer / nosniff / X-Frame-Options: DENY`
@@ -49,12 +49,13 @@ napcat/plugins/
 systemd/
   qq-relogin-watch.service    # 看门狗 unit（Type=simple + Restart=always）
 tests/
-  mock.test.mjs                 # 42 用例：假内核 + 真 HTTP，不连 QQ
+  mock.test.mjs                 # 43 用例：假内核 + 真 HTTP，不连 QQ
   race-check.mjs                # 加群去重的独立取证脚本（JOINER_SRC 可指定源码）
   queue-check.mjs               # 有界内核队列的独立取证脚本（JOINER_SRC 可指定源码）
   timeout-check.mjs             # 内核超时不放槽的独立取证脚本
   relogin-check.py              # 重登策略回归：假 WebUI 验退避/上限/恢复/验证码/状态损坏
   online-smoke.sh               # 线上只读 smoke（VPS 上跑：鉴权/路由基数/dryRun/容器健康）
+  online-iter.py                # 线上深度迭代验证（cookie/CSRF/代理头/并发/延迟/配额）
   run-all.mjs                   # npm test 入口：拷插件 + 五连跑
   port-check.mjs                # cleanup 关端口 / 二次 init
   README.md                     # 测试说明与历史回归锚点
@@ -123,7 +124,7 @@ systemctl daemon-reload && systemctl enable --now qq-relogin-watch
 ## 测试
 
 ```bash
-npm test                 # 一条命令：拷插件 + mock 42 用例 + race + queue + timeout + relogin
+npm test                 # 一条命令：拷插件 + mock 43 用例 + race + queue + timeout + relogin
 
 # 或分段跑（调试时更直观）：
 JOINER_DIR=../napcat/plugins/napcat-plugin-joiner \
@@ -134,9 +135,11 @@ node tests/timeout-check.mjs
 python3 -I tests/relogin-check.py
 ```
 
-42/42 全绿 + 竞态/排队/超时/重登四份取证，共 5 段，总时长约 35s。没有 `python3` 时重登那段会**判 FAIL**（不再静默跳过）；确实要临时跳过，用 `ALLOW_PY_SKIP=1 npm test`。回归锚点（旧版本应当红）见 `tests/README.md`。
+43/43 全绿 + 竞态/排队/超时/重登四份取证，共 5 段，总时长约 35s。没有 `python3` 时重登那段会**判 FAIL**（不再静默跳过）；确实要临时跳过，用 `ALLOW_PY_SKIP=1 npm test`。回归锚点（旧版本应当红）见 `tests/README.md`。
 
 上线后冒烟（在 VPS 上，只读 + dryRun，不打印 token）：`bash tests/online-smoke.sh`。仓库是公开的，真实 QQ/群号/内网与公网地址不入库——跑 VPS 前先注入：`SMOKE_MESH=<mesh 地址>`（受信代理闸门小节）、`SMOKE_PUB=<公网前缀>`（公网鉴权/路由小节）、`SMOKE_QQ_ID` / `SMOKE_GROUP`（可选，页面部署行与冒烟例群；不设则跳过对应检查）。
+
+更深的线上语义验证用 `python3 -I tests/online-iter.py`：覆盖口令换 cookie、CSRF 同源、受信代理头、24+12 并发排水、路由延迟单调性与列表缓存配额共享，成功输出 `RESULT=OK`；同样从 `SMOKE_BASE` / `SMOKE_MESH` / `SMOKE_GROUP` / `SMOKE_TOKEN_FILE` 注入环境相关值。
 
 ## 上游与致谢
 

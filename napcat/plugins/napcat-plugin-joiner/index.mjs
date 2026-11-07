@@ -770,7 +770,10 @@ export async function plugin_init(ctx) {
       const auth = authOf(req, url);
       if (!auth.ok) {
         STATS.authFailures++;
-        noteAuthFail(ip, Date.now());
+        // 只有「带了口令但不对」才计入爆破计数。完全没带口令的请求多半是
+        // 扫描器 / 健康检查 / 未鉴权的运维探针：回 401 就够，不该把该 IP
+        // 锁 10 分钟（线上 smoke 曾因此把自己出口 IP 打成 429）。
+        if (auth.source !== "none") noteAuthFail(ip, Date.now());
         send(res, 401, { ok: false, error: "unauthorized" });
         return;
       }
